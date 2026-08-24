@@ -1,0 +1,10 @@
+.DS_Store
+.secrets/
+.runtime/
+.local/
+artifacts/
+*.dec
+*.plain
+*.tar
+*.tar.gz
+*.log
