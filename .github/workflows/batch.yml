@@ -1,0 +1,344 @@
+name: Scheduled Batch
+
+on:
+  schedule:
+    - cron: "43 10 * * 5"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: scheduled-batch-main
+  queue: max
+
+jobs:
+  execute:
+    name: Execute encrypted batch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      base_sha: ${{ steps.handoff.outputs.base_sha }}
+      state_digest: ${{ steps.handoff.outputs.state_digest }}
+    steps:
+      - name: Check out control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Prepare encrypted runtime
+        id: prepare
+        shell: bash
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -z "${BUNDLE_KEY:-}" ]]; then
+            echo "::error::Required runtime material is unavailable."
+            exit 1
+          fi
+          printf '%s' "$BUNDLE_KEY" > "$RUNNER_TEMP/bundle.pass"
+          unset BUNDLE_KEY
+          mkdir -p "$RUNNER_TEMP/private-runtime"
+          set +e
+          (
+            set -euo pipefail
+            test -s payload/runtime.enc
+            python tools/envelope.py decrypt \
+              --context runtime \
+              --key-file "$RUNNER_TEMP/bundle.pass" \
+              --input payload/runtime.enc \
+              --output "$RUNNER_TEMP/runtime.tar.gz"
+            python tools/archive_guard.py \
+              --archive "$RUNNER_TEMP/runtime.tar.gz" \
+              --destination "$RUNNER_TEMP/private-runtime"
+            test -f "$RUNNER_TEMP/private-runtime/pyproject.toml"
+            test -f "$RUNNER_TEMP/private-runtime/tools/private_batch.py"
+            test -f "$RUNNER_TEMP/private-runtime/tools/prepare_system.sh"
+            unlink "$RUNNER_TEMP/bundle.pass"
+            sudo bash "$RUNNER_TEMP/private-runtime/tools/prepare_system.sh"
+            python -m pip install --disable-pip-version-check --quiet "$RUNNER_TEMP/private-runtime"
+          ) >"$RUNNER_TEMP/prepare.log" 2>&1
+          status=$?
+          set -e
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::Runtime preparation failed."
+            exit "$status"
+          fi
+
+      - name: Execute private batch
+        id: execute
+        if: success()
+        shell: bash
+        env:
+          SERVICE_TOKEN: ${{ secrets.SERVICE_TOKEN }}
+          JOB_EVENT: ${{ github.event_name }}
+          JOB_EXPORT_DIR: ${{ runner.temp }}/private-export
+          JOB_STATE_DIR: ${{ runner.temp }}/private-runtime-next
+        run: |
+          set -euo pipefail
+          if [[ -z "${SERVICE_TOKEN:-}" ]]; then
+            echo "::error::Required service credential is unavailable."
+            exit 1
+          fi
+          if [[ "$JOB_EVENT" == "schedule" ]]; then
+            export JOB_MODE="scheduled"
+          else
+            export JOB_MODE="preview"
+          fi
+          mkdir -p "$JOB_EXPORT_DIR"
+          set +e
+          (
+            cd "$RUNNER_TEMP/private-runtime"
+            python -m tools.private_batch --mode "$JOB_MODE"
+          ) >"$RUNNER_TEMP/job.log" 2>&1
+          status=$?
+          set -e
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::Batch execution failed. Download the encrypted diagnostic artifact."
+            exit "$status"
+          fi
+          echo "Batch execution completed."
+
+      - name: Verify persistence boundary
+        if: steps.execute.outcome == 'success'
+        shell: bash
+        env:
+          SERVICE_TOKEN: ${{ secrets.SERVICE_TOKEN }}
+        run: |
+          set -euo pipefail
+          python tools/secret_guard.py \
+            --environment SERVICE_TOKEN \
+            --path "$RUNNER_TEMP/private-runtime" \
+            --path "$RUNNER_TEMP/private-export" \
+            --path "$RUNNER_TEMP/private-runtime-next" \
+            --path "$RUNNER_TEMP/job.log"
+
+      - name: Encrypt result and diagnostics
+        id: package
+        if: always()
+        shell: bash
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -z "${BUNDLE_KEY:-}" ]]; then
+            echo "::error::Result encryption material is unavailable."
+            exit 1
+          fi
+          if [[ ! -s "$RUNNER_TEMP/bundle.pass" ]]; then
+            printf '%s' "$BUNDLE_KEY" > "$RUNNER_TEMP/bundle.pass"
+          fi
+          unset BUNDLE_KEY
+          mkdir -p "$RUNNER_TEMP/result-envelope" artifacts
+          if [[ -f "$RUNNER_TEMP/prepare.log" ]]; then
+            cp "$RUNNER_TEMP/prepare.log" "$RUNNER_TEMP/result-envelope/prepare.log"
+          fi
+          if [[ -f "$RUNNER_TEMP/job.log" ]]; then
+            cp "$RUNNER_TEMP/job.log" "$RUNNER_TEMP/result-envelope/job.log"
+          fi
+          if [[ -d "$RUNNER_TEMP/private-export" ]]; then
+            cp -R "$RUNNER_TEMP/private-export" "$RUNNER_TEMP/result-envelope/output"
+          fi
+          {
+            echo "prepare=$PREPARE_OUTCOME"
+            echo "execute=$EXECUTE_OUTCOME"
+            echo "run_id=$GITHUB_RUN_ID"
+          } > "$RUNNER_TEMP/result-envelope/status.txt"
+          tar -czf "$RUNNER_TEMP/result.tar.gz" -C "$RUNNER_TEMP/result-envelope" .
+          python tools/envelope.py encrypt \
+            --context result \
+            --key-file "$RUNNER_TEMP/bundle.pass" \
+            --input "$RUNNER_TEMP/result.tar.gz" \
+            --output artifacts/result.enc
+          python tools/envelope.py decrypt \
+            --context result \
+            --key-file "$RUNNER_TEMP/bundle.pass" \
+            --input artifacts/result.enc \
+            --output "$RUNNER_TEMP/result.verify.tar.gz"
+          cmp -s "$RUNNER_TEMP/result.tar.gz" "$RUNNER_TEMP/result.verify.tar.gz"
+          test -s artifacts/result.enc
+
+      - name: Upload encrypted artifact
+        if: always() && steps.package.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: batch-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/result.enc
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Prepare encrypted state handoff
+        id: handoff
+        if: success() && github.event_name == 'schedule'
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$RUNNER_TEMP/state-handoff"
+          test -f "$RUNNER_TEMP/private-runtime-next/.runtime-ready"
+          tar -czf "$RUNNER_TEMP/runtime.next.tar.gz" \
+            -C "$RUNNER_TEMP/private-runtime-next" .
+          python tools/envelope.py encrypt \
+            --context runtime \
+            --key-file "$RUNNER_TEMP/bundle.pass" \
+            --input "$RUNNER_TEMP/runtime.next.tar.gz" \
+            --output "$RUNNER_TEMP/state-handoff/runtime.enc"
+          python tools/envelope.py decrypt \
+            --context runtime \
+            --key-file "$RUNNER_TEMP/bundle.pass" \
+            --input "$RUNNER_TEMP/state-handoff/runtime.enc" \
+            --output "$RUNNER_TEMP/runtime.next.verify.tar.gz"
+          cmp -s "$RUNNER_TEMP/runtime.next.tar.gz" "$RUNNER_TEMP/runtime.next.verify.tar.gz"
+          mkdir -p "$RUNNER_TEMP/runtime-next-verify"
+          python tools/archive_guard.py \
+            --archive "$RUNNER_TEMP/runtime.next.verify.tar.gz" \
+            --destination "$RUNNER_TEMP/runtime-next-verify"
+          test -f "$RUNNER_TEMP/runtime-next-verify/.runtime-ready"
+          test -f "$RUNNER_TEMP/runtime-next-verify/pyproject.toml"
+          test -f "$RUNNER_TEMP/runtime-next-verify/requirements.txt"
+          test -f "$RUNNER_TEMP/runtime-next-verify/tools/__init__.py"
+          test -f "$RUNNER_TEMP/runtime-next-verify/tools/private_batch.py"
+          test -f "$RUNNER_TEMP/runtime-next-verify/tools/prepare_system.sh"
+          base_sha="$(git rev-parse HEAD)"
+          state_digest="$(sha256sum "$RUNNER_TEMP/state-handoff/runtime.enc")"
+          state_digest="${state_digest%% *}"
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "state_digest=$state_digest" >> "$GITHUB_OUTPUT"
+
+      - name: Upload encrypted state handoff
+        if: success() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/state-handoff/runtime.enc
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove plaintext workspace
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in \
+            "$RUNNER_TEMP/private-runtime" \
+            "$RUNNER_TEMP/private-runtime-next" \
+            "$RUNNER_TEMP/private-export" \
+            "$RUNNER_TEMP/result-envelope" \
+            "$RUNNER_TEMP/state-handoff" \
+            "$RUNNER_TEMP/runtime-next-verify"; do
+            if [[ -e "$target" ]]; then
+              find "$target" -depth -delete
+            fi
+          done
+          for target in \
+            "$RUNNER_TEMP/bundle.pass" \
+            "$RUNNER_TEMP/runtime.tar.gz" \
+            "$RUNNER_TEMP/runtime.next.tar.gz" \
+            "$RUNNER_TEMP/runtime.next.verify.tar.gz" \
+            "$RUNNER_TEMP/result.tar.gz" \
+            "$RUNNER_TEMP/result.verify.tar.gz" \
+            "$RUNNER_TEMP/prepare.log" \
+            "$RUNNER_TEMP/job.log"; do
+            if [[ -f "$target" ]]; then
+              unlink "$target"
+            fi
+          done
+
+  persist:
+    name: Persist opaque state
+    needs: execute
+    if: github.event_name == 'schedule' && needs.execute.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out current control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: true
+
+      - name: Download opaque state
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: state-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/state-handoff-in
+
+      - name: Validate opaque handoff
+        shell: bash
+        env:
+          HANDOFF_BASE_SHA: ${{ needs.execute.outputs.base_sha }}
+          HANDOFF_STATE_DIGEST: ${{ needs.execute.outputs.state_digest }}
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/state-handoff-in/runtime.enc"
+          test "$(find "$RUNNER_TEMP/state-handoff-in" -type f | wc -l | tr -d ' ')" = "1"
+          base_sha="$HANDOFF_BASE_SHA"
+          state_digest="$HANDOFF_STATE_DIGEST"
+          if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid handoff base revision."
+            exit 1
+          fi
+          if [[ ! "$state_digest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid opaque state digest."
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$base_sha" ]]; then
+            echo "::error::The control plane changed during execution."
+            exit 1
+          fi
+          actual_digest="$(sha256sum "$RUNNER_TEMP/state-handoff-in/runtime.enc")"
+          actual_digest="${actual_digest%% *}"
+          if [[ "$actual_digest" != "$state_digest" ]]; then
+            echo "::error::Opaque state digest mismatch."
+            exit 1
+          fi
+
+      - name: Commit opaque state
+        shell: bash
+        env:
+          HANDOFF_BASE_SHA: ${{ needs.execute.outputs.base_sha }}
+        run: |
+          set -euo pipefail
+          base_sha="$HANDOFF_BASE_SHA"
+          cp "$RUNNER_TEMP/state-handoff-in/runtime.enc" payload/runtime.enc
+          status="$(git status --porcelain)"
+          if [[ "$status" != " M payload/runtime.enc" ]]; then
+            echo "::error::Unexpected control-plane change."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add payload/runtime.enc
+          if [[ "$(git diff --cached --name-only)" != "payload/runtime.enc" ]]; then
+            echo "::error::Unexpected staged path."
+            exit 1
+          fi
+          if git diff --cached --quiet; then
+            echo "::error::Opaque state did not change."
+            exit 1
+          fi
+          git commit -m "chore: refresh batch state"
+          git fetch origin main
+          if [[ "$(git rev-parse origin/main)" != "$base_sha" ]]; then
+            echo "::error::The control plane changed before persistence."
+            exit 1
+          fi
+          git push origin HEAD:main
