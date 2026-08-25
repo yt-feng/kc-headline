@@ -21,6 +21,10 @@ jobs:
     outputs:
       base_sha: ${{ steps.handoff.outputs.base_sha }}
       state_digest: ${{ steps.handoff.outputs.state_digest }}
+      document_digest: ${{ steps.handoff.outputs.document_digest }}
+      pdf_digest: ${{ steps.handoff.outputs.pdf_digest }}
+      output_date: ${{ steps.handoff.outputs.output_date }}
+      should_persist: ${{ steps.plan.outputs.should_persist }}
     steps:
       - name: Check out control plane
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -75,9 +79,96 @@ jobs:
             exit "$status"
           fi
 
+      - name: Plan repository update
+        id: plan
+        shell: bash
+        env:
+          JOB_EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$JOB_EVENT" != "schedule" ]]; then
+            echo "should_persist=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          (
+            cd "$RUNNER_TEMP/private-runtime"
+            python -m tools.private_batch --mode plan > "$RUNNER_TEMP/plan.json"
+          )
+          plan_values="$(python - "$RUNNER_TEMP/plan.json" <<'PY'
+          import datetime as dt
+          import json
+          import pathlib
+          import sys
+
+          plan = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          if set(plan) != {"status", "mode", "publication_date", "already_published"}:
+              raise SystemExit("unexpected plan schema")
+          if plan["status"] != "ok" or plan["mode"] != "plan":
+              raise SystemExit("invalid plan status")
+          value = plan["publication_date"]
+          published = plan["already_published"]
+          if not isinstance(value, str) or not isinstance(published, bool):
+              raise SystemExit("invalid plan values")
+          parsed = dt.date.fromisoformat(value)
+          if parsed.isoformat() != value or parsed.weekday() != 4:
+              raise SystemExit("non-canonical plan date")
+          print(f"{value}|{'true' if published else 'false'}")
+          PY
+          )"
+          IFS='|' read -r output_date already_published <<EOF
+          $plan_values
+          EOF
+          if [[ ! "$output_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid planned output date."
+            exit 1
+          fi
+
+          document_path="output/$output_date.docx"
+          pdf_path="output/$output_date.pdf"
+          document_exists=false
+          pdf_exists=false
+          if [[ -e "$document_path" || -L "$document_path" ]]; then
+            if [[ ! -f "$document_path" || -L "$document_path" ]]; then
+              echo "::error::Invalid planned document path."
+              exit 1
+            fi
+            document_exists=true
+          fi
+          if [[ -e "$pdf_path" || -L "$pdf_path" ]]; then
+            if [[ ! -f "$pdf_path" || -L "$pdf_path" ]]; then
+              echo "::error::Invalid planned portable document path."
+              exit 1
+            fi
+            pdf_exists=true
+          fi
+
+          echo "output_date=$output_date" >> "$GITHUB_OUTPUT"
+          if [[ "$document_exists" == "true" && "$pdf_exists" == "true" ]]; then
+            if [[ "$already_published" != "true" ]]; then
+              echo "::error::The scheduled output is ahead of persisted state."
+              exit 1
+            fi
+            git ls-files --error-unmatch "$document_path" "$pdf_path" >/dev/null
+            echo "should_persist=false" >> "$GITHUB_OUTPUT"
+            echo "The scheduled output already exists."
+            exit 0
+          fi
+          if [[ "$document_exists" != "$pdf_exists" ]]; then
+            echo "::error::The scheduled output pair is incomplete."
+            exit 1
+          fi
+          if [[ "$already_published" == "true" ]]; then
+            echo "::error::Persisted state has no matching scheduled output."
+            exit 1
+          fi
+          echo "should_persist=true" >> "$GITHUB_OUTPUT"
+
       - name: Execute private batch
         id: execute
-        if: success()
+        if: >-
+          success() &&
+          (github.event_name != 'schedule' || steps.plan.outputs.should_persist == 'true')
         shell: bash
         env:
           SERVICE_TOKEN: ${{ secrets.SERVICE_TOKEN }}
@@ -183,12 +274,16 @@ jobs:
 
       - name: Prepare encrypted state handoff
         id: handoff
-        if: success() && github.event_name == 'schedule'
+        if: >-
+          success() && github.event_name == 'schedule' &&
+          steps.plan.outputs.should_persist == 'true'
         shell: bash
+        env:
+          PLANNED_OUTPUT_DATE: ${{ steps.plan.outputs.output_date }}
         run: |
           set -euo pipefail
           umask 077
-          mkdir -p "$RUNNER_TEMP/state-handoff"
+          mkdir -p "$RUNNER_TEMP/state-handoff" "$RUNNER_TEMP/output-handoff"
           test -f "$RUNNER_TEMP/private-runtime-next/.runtime-ready"
           tar -czf "$RUNNER_TEMP/runtime.next.tar.gz" \
             -C "$RUNNER_TEMP/private-runtime-next" .
@@ -213,18 +308,196 @@ jobs:
           test -f "$RUNNER_TEMP/runtime-next-verify/tools/__init__.py"
           test -f "$RUNNER_TEMP/runtime-next-verify/tools/private_batch.py"
           test -f "$RUNNER_TEMP/runtime-next-verify/tools/prepare_system.sh"
+
+          output_date="$(python - \
+            "$RUNNER_TEMP/private-export" \
+            "$RUNNER_TEMP/output-handoff" \
+            "$RUNNER_TEMP/runtime-next-verify/state/issue.json" \
+            "$RUNNER_TEMP/runtime-next-verify/reports/index.json" \
+            "$PLANNED_OUTPUT_DATE" <<'PY'
+          import datetime as dt
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import shutil
+          import sys
+          import zipfile
+
+          export_root = pathlib.Path(sys.argv[1])
+          output_root = pathlib.Path(sys.argv[2])
+          state_path = pathlib.Path(sys.argv[3])
+          index_path = pathlib.Path(sys.argv[4])
+          planned_date = sys.argv[5]
+          if not export_root.is_dir() or export_root.is_symlink():
+              raise SystemExit("invalid export directory")
+          members = list(export_root.iterdir())
+          if len(members) != 4 or any(
+              not path.is_file() or path.is_symlink() for path in members
+          ):
+              raise SystemExit("export must contain four regular files")
+          documents = [path for path in members if path.suffix == ".docx"]
+          pdfs = [path for path in members if path.suffix == ".pdf"]
+          manifests = [path for path in members if path.name == "manifest.json"]
+          checksum_files = [
+              path for path in members if path.name == "checksums.sha256"
+          ]
+          if not all(
+              len(group) == 1
+              for group in (documents, pdfs, manifests, checksum_files)
+          ):
+              raise SystemExit("export does not contain one validated file set")
+
+          data = json.loads(manifests[0].read_text(encoding="utf-8"))
+          if data.get("status") != "validated":
+              raise SystemExit("export is not validated")
+          issue = data.get("issue")
+          if not isinstance(issue, dict):
+              raise SystemExit("missing issue metadata")
+          value = issue.get("publication_date")
+          if not isinstance(value, str):
+              raise SystemExit("missing publication date")
+          parsed = dt.date.fromisoformat(value)
+          if parsed.isoformat() != value or parsed.weekday() != 4:
+              raise SystemExit("non-canonical publication date")
+          if value != planned_date:
+              raise SystemExit("export date differs from the scheduled plan")
+
+          document = documents[0]
+          pdf = pdfs[0]
+          if document.name != f"{value}.docx" or pdf.name != f"{value}.pdf":
+              raise SystemExit("export filenames are not date-only")
+
+          checksum_lines = checksum_files[0].read_text(
+              encoding="utf-8"
+          ).splitlines()
+          if len(checksum_lines) != 3:
+              raise SystemExit("invalid checksum entry count")
+          checksums = {}
+          for line in checksum_lines:
+              match = re.fullmatch(r"([0-9a-f]{64})  ([^/\\]+)", line)
+              if match is None or match.group(2) in checksums:
+                  raise SystemExit("invalid checksum entry")
+              checksums[match.group(2)] = match.group(1)
+          checked_files = {document.name, pdf.name, manifests[0].name}
+          if set(checksums) != checked_files:
+              raise SystemExit("checksum path set mismatch")
+          for path in (document, pdf, manifests[0]):
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if digest != checksums[path.name]:
+                  raise SystemExit("checksum mismatch")
+
+          issue_identity = {
+              "publication_date": value,
+              "year": parsed.year,
+              "annual_issue": issue.get("annual_issue"),
+              "total_issue": issue.get("total_issue"),
+          }
+          if not all(
+              isinstance(issue_identity[key], int)
+              and not isinstance(issue_identity[key], bool)
+              and issue_identity[key] > 0
+              for key in ("annual_issue", "total_issue")
+          ):
+              raise SystemExit("invalid issue identity")
+          if issue.get("year") != parsed.year:
+              raise SystemExit("issue year mismatch")
+
+          state = json.loads(state_path.read_text(encoding="utf-8"))
+          last_published = state.get("last_published")
+          if state.get("schema_version") != 1 or not isinstance(
+              last_published, dict
+          ):
+              raise SystemExit("invalid persisted state")
+          if any(
+              last_published.get(key) != expected
+              for key, expected in issue_identity.items()
+          ):
+              raise SystemExit("persisted state does not match the export")
+
+          index = json.loads(index_path.read_text(encoding="utf-8"))
+          publications = index.get("publications")
+          if index.get("schema_version") != 1 or not isinstance(
+              publications, list
+          ) or not publications:
+              raise SystemExit("invalid persisted index")
+          matching_rows = [
+              row
+              for row in publications
+              if isinstance(row, dict)
+              and row.get("publication_date") == value
+          ]
+          if len(matching_rows) != 1 or publications[-1] is not matching_rows[0]:
+              raise SystemExit("persisted index date mismatch")
+          index_row = matching_rows[0]
+          if any(
+              index_row.get(key) != expected
+              for key, expected in issue_identity.items()
+          ) or index_row.get("status") != "private-exported":
+              raise SystemExit("persisted index identity mismatch")
+          delivery = index_row.get("delivery")
+          if not isinstance(delivery, dict) or (
+              delivery.get("type") != "job-export"
+              or delivery.get("manifest") != "manifest.json"
+              or delivery.get("manifest_sha256") != checksums["manifest.json"]
+          ):
+              raise SystemExit("persisted index manifest mismatch")
+
+          if not zipfile.is_zipfile(document):
+              raise SystemExit("invalid document container")
+          with zipfile.ZipFile(document) as archive:
+              required = {"[Content_Types].xml", "word/document.xml"}
+              if not required.issubset(archive.namelist()):
+                  raise SystemExit("incomplete document container")
+              if archive.testzip() is not None:
+                  raise SystemExit("corrupt document member")
+          with pdf.open("rb") as handle:
+              if handle.read(5) != b"%PDF-":
+                  raise SystemExit("invalid portable document")
+
+          shutil.copyfile(document, output_root / f"{value}.docx")
+          shutil.copyfile(pdf, output_root / f"{value}.pdf")
+          print(value)
+          PY
+          )"
+          if [[ ! "$output_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid scheduled output date."
+            exit 1
+          fi
+
           base_sha="$(git rev-parse HEAD)"
           state_digest="$(sha256sum "$RUNNER_TEMP/state-handoff/runtime.enc")"
           state_digest="${state_digest%% *}"
+          document_digest="$(sha256sum "$RUNNER_TEMP/output-handoff/$output_date.docx")"
+          document_digest="${document_digest%% *}"
+          pdf_digest="$(sha256sum "$RUNNER_TEMP/output-handoff/$output_date.pdf")"
+          pdf_digest="${pdf_digest%% *}"
+
           echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
           echo "state_digest=$state_digest" >> "$GITHUB_OUTPUT"
+          echo "document_digest=$document_digest" >> "$GITHUB_OUTPUT"
+          echo "pdf_digest=$pdf_digest" >> "$GITHUB_OUTPUT"
+          echo "output_date=$output_date" >> "$GITHUB_OUTPUT"
 
       - name: Upload encrypted state handoff
-        if: success() && github.event_name == 'schedule'
+        if: >-
+          success() && github.event_name == 'schedule' &&
+          steps.plan.outputs.should_persist == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: state-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/state-handoff/runtime.enc
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload scheduled output handoff
+        if: >-
+          success() && github.event_name == 'schedule' &&
+          steps.plan.outputs.should_persist == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: output-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/output-handoff
           if-no-files-found: error
           retention-days: 1
 
@@ -239,6 +512,7 @@ jobs:
             "$RUNNER_TEMP/private-export" \
             "$RUNNER_TEMP/result-envelope" \
             "$RUNNER_TEMP/state-handoff" \
+            "$RUNNER_TEMP/output-handoff" \
             "$RUNNER_TEMP/runtime-next-verify"; do
             if [[ -e "$target" ]]; then
               find "$target" -depth -delete
@@ -251,6 +525,7 @@ jobs:
             "$RUNNER_TEMP/runtime.next.verify.tar.gz" \
             "$RUNNER_TEMP/result.tar.gz" \
             "$RUNNER_TEMP/result.verify.tar.gz" \
+            "$RUNNER_TEMP/plan.json" \
             "$RUNNER_TEMP/prepare.log" \
             "$RUNNER_TEMP/job.log"; do
             if [[ -f "$target" ]]; then
@@ -259,9 +534,11 @@ jobs:
           done
 
   persist:
-    name: Persist opaque state
+    name: Persist validated batch
     needs: execute
-    if: github.event_name == 'schedule' && needs.execute.result == 'success'
+    if: >-
+      github.event_name == 'schedule' && needs.execute.result == 'success' &&
+      needs.execute.outputs.should_persist == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -281,61 +558,207 @@ jobs:
           name: state-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/state-handoff-in
 
-      - name: Validate opaque handoff
+      - name: Download scheduled output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: output-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/output-handoff-in
+
+      - name: Validate fixed handoff
         shell: bash
         env:
           HANDOFF_BASE_SHA: ${{ needs.execute.outputs.base_sha }}
           HANDOFF_STATE_DIGEST: ${{ needs.execute.outputs.state_digest }}
+          HANDOFF_DOCUMENT_DIGEST: ${{ needs.execute.outputs.document_digest }}
+          HANDOFF_PDF_DIGEST: ${{ needs.execute.outputs.pdf_digest }}
+          HANDOFF_OUTPUT_DATE: ${{ needs.execute.outputs.output_date }}
         run: |
           set -euo pipefail
-          test -s "$RUNNER_TEMP/state-handoff-in/runtime.enc"
-          test "$(find "$RUNNER_TEMP/state-handoff-in" -type f | wc -l | tr -d ' ')" = "1"
+          state_root="$RUNNER_TEMP/state-handoff-in"
+          output_root="$RUNNER_TEMP/output-handoff-in"
+          output_date="$HANDOFF_OUTPUT_DATE"
           base_sha="$HANDOFF_BASE_SHA"
           state_digest="$HANDOFF_STATE_DIGEST"
+          document_digest="$HANDOFF_DOCUMENT_DIGEST"
+          pdf_digest="$HANDOFF_PDF_DIGEST"
+
           if [[ ! "$base_sha" =~ ^[0-9a-f]{40}$ ]]; then
             echo "::error::Invalid handoff base revision."
             exit 1
           fi
-          if [[ ! "$state_digest" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::Invalid opaque state digest."
+          if [[ ! "$state_digest" =~ ^[0-9a-f]{64}$ \
+            || ! "$document_digest" =~ ^[0-9a-f]{64}$ \
+            || ! "$pdf_digest" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid handoff digest."
             exit 1
           fi
+          if [[ ! "$output_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid handoff output date."
+            exit 1
+          fi
+
+          actual_state_paths="$(
+            cd "$state_root"
+            find . -type f -print | LC_ALL=C sort
+          )"
+          if [[ "$actual_state_paths" != './runtime.enc' ]]; then
+            echo "::error::Unexpected state handoff path set."
+            exit 1
+          fi
+          expected_output_paths="$(printf '%s\n' \
+            "./$output_date.docx" \
+            "./$output_date.pdf" | LC_ALL=C sort)"
+          actual_output_paths="$(
+            cd "$output_root"
+            find . -type f -print | LC_ALL=C sort
+          )"
+          if [[ "$actual_output_paths" != "$expected_output_paths" ]]; then
+            echo "::error::Unexpected output handoff path set."
+            exit 1
+          fi
+          if find "$state_root" "$output_root" -type l -print -quit | grep -q .; then
+            echo "::error::Symbolic links are not allowed in the handoff."
+            exit 1
+          fi
+          if find "$state_root" "$output_root" -mindepth 1 -type d -print -quit | grep -q .; then
+            echo "::error::Directories are not allowed inside the handoff."
+            exit 1
+          fi
+          test -s "$state_root/runtime.enc"
+          test -s "$output_root/$output_date.docx"
+          test -s "$output_root/$output_date.pdf"
+
+          python - "$output_date" <<'PY'
+          import datetime as dt
+          import sys
+
+          parsed_date = dt.date.fromisoformat(sys.argv[1])
+          if parsed_date.isoformat() != sys.argv[1] or parsed_date.weekday() != 4:
+              raise SystemExit("non-canonical handoff output date")
+          PY
+
           if [[ "$(git rev-parse HEAD)" != "$base_sha" ]]; then
             echo "::error::The control plane changed during execution."
             exit 1
           fi
-          actual_digest="$(sha256sum "$RUNNER_TEMP/state-handoff-in/runtime.enc")"
-          actual_digest="${actual_digest%% *}"
-          if [[ "$actual_digest" != "$state_digest" ]]; then
-            echo "::error::Opaque state digest mismatch."
+          actual_state_digest="$(sha256sum "$state_root/runtime.enc")"
+          actual_state_digest="${actual_state_digest%% *}"
+          actual_document_digest="$(sha256sum "$output_root/$output_date.docx")"
+          actual_document_digest="${actual_document_digest%% *}"
+          actual_pdf_digest="$(sha256sum "$output_root/$output_date.pdf")"
+          actual_pdf_digest="${actual_pdf_digest%% *}"
+          if [[ "$actual_state_digest" != "$state_digest" \
+            || "$actual_document_digest" != "$document_digest" \
+            || "$actual_pdf_digest" != "$pdf_digest" ]]; then
+            echo "::error::Handoff file digest mismatch."
             exit 1
           fi
 
-      - name: Commit opaque state
+          python - \
+            "$output_root/$output_date.docx" \
+            "$output_root/$output_date.pdf" <<'PY'
+          import pathlib
+          import sys
+          import zipfile
+
+          document = pathlib.Path(sys.argv[1])
+          pdf = pathlib.Path(sys.argv[2])
+          if not zipfile.is_zipfile(document):
+              raise SystemExit("invalid document container")
+          with zipfile.ZipFile(document) as archive:
+              required = {"[Content_Types].xml", "word/document.xml"}
+              if not required.issubset(archive.namelist()) or archive.testzip() is not None:
+                  raise SystemExit("invalid document contents")
+          with pdf.open("rb") as handle:
+              if handle.read(5) != b"%PDF-":
+                  raise SystemExit("invalid portable document")
+          PY
+
+      - name: Commit validated batch
         shell: bash
         env:
           HANDOFF_BASE_SHA: ${{ needs.execute.outputs.base_sha }}
+          HANDOFF_OUTPUT_DATE: ${{ needs.execute.outputs.output_date }}
+          HANDOFF_STATE_DIGEST: ${{ needs.execute.outputs.state_digest }}
+          HANDOFF_DOCUMENT_DIGEST: ${{ needs.execute.outputs.document_digest }}
+          HANDOFF_PDF_DIGEST: ${{ needs.execute.outputs.pdf_digest }}
         run: |
           set -euo pipefail
           base_sha="$HANDOFF_BASE_SHA"
-          cp "$RUNNER_TEMP/state-handoff-in/runtime.enc" payload/runtime.enc
-          status="$(git status --porcelain)"
-          if [[ "$status" != " M payload/runtime.enc" ]]; then
+          output_date="$HANDOFF_OUTPUT_DATE"
+          state_root="$RUNNER_TEMP/state-handoff-in"
+          output_root="$RUNNER_TEMP/output-handoff-in"
+          mkdir -p output
+          if [[ -e "output/$output_date.docx" || -L "output/$output_date.docx" \
+            || -e "output/$output_date.pdf" || -L "output/$output_date.pdf" ]]; then
+            echo "::error::The scheduled output already exists."
+            exit 1
+          fi
+          cp "$state_root/runtime.enc" payload/runtime.enc
+          cp "$output_root/$output_date.docx" "output/$output_date.docx"
+          cp "$output_root/$output_date.pdf" "output/$output_date.pdf"
+
+          persisted_state_digest="$(sha256sum payload/runtime.enc)"
+          persisted_state_digest="${persisted_state_digest%% *}"
+          persisted_document_digest="$(sha256sum "output/$output_date.docx")"
+          persisted_document_digest="${persisted_document_digest%% *}"
+          persisted_pdf_digest="$(sha256sum "output/$output_date.pdf")"
+          persisted_pdf_digest="${persisted_pdf_digest%% *}"
+          if [[ "$persisted_state_digest" != "$HANDOFF_STATE_DIGEST" \
+            || "$persisted_document_digest" != "$HANDOFF_DOCUMENT_DIGEST" \
+            || "$persisted_pdf_digest" != "$HANDOFF_PDF_DIGEST" ]]; then
+            echo "::error::Persisted file digest mismatch."
+            exit 1
+          fi
+
+          expected_worktree_status="$(printf '%s\n' \
+            ' M payload/runtime.enc' \
+            "?? output/$output_date.docx" \
+            "?? output/$output_date.pdf" | LC_ALL=C sort)"
+          actual_worktree_status="$(
+            git status --porcelain=v1 --untracked-files=all | LC_ALL=C sort
+          )"
+          if [[ "$actual_worktree_status" != "$expected_worktree_status" ]]; then
             echo "::error::Unexpected control-plane change."
             exit 1
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add payload/runtime.enc
-          if [[ "$(git diff --cached --name-only)" != "payload/runtime.enc" ]]; then
-            echo "::error::Unexpected staged path."
-            exit 1
-          fi
-          if git diff --cached --quiet; then
+          if git diff --quiet -- payload/runtime.enc; then
             echo "::error::Opaque state did not change."
             exit 1
           fi
-          git commit -m "chore: refresh batch state"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            payload/runtime.enc \
+            "output/$output_date.docx" \
+            "output/$output_date.pdf"
+          expected_staged_status="$(printf '%s\t%s\n' \
+            'A' "output/$output_date.docx" \
+            'A' "output/$output_date.pdf" \
+            'M' 'payload/runtime.enc' | LC_ALL=C sort)"
+          actual_staged_status="$(
+            git diff --cached --name-status | LC_ALL=C sort
+          )"
+          if [[ "$actual_staged_status" != "$expected_staged_status" ]]; then
+            echo "::error::Unexpected staged change set."
+            exit 1
+          fi
+
+          staged_state_digest="$(git show ':payload/runtime.enc' | sha256sum)"
+          staged_state_digest="${staged_state_digest%% *}"
+          staged_document_digest="$(git show ":output/$output_date.docx" | sha256sum)"
+          staged_document_digest="${staged_document_digest%% *}"
+          staged_pdf_digest="$(git show ":output/$output_date.pdf" | sha256sum)"
+          staged_pdf_digest="${staged_pdf_digest%% *}"
+          if [[ "$staged_state_digest" != "$HANDOFF_STATE_DIGEST" \
+            || "$staged_document_digest" != "$HANDOFF_DOCUMENT_DIGEST" \
+            || "$staged_pdf_digest" != "$HANDOFF_PDF_DIGEST" ]]; then
+            echo "::error::Staged file digest mismatch."
+            exit 1
+          fi
+
+          git commit -m "chore: publish scheduled batch"
           git fetch origin main
           if [[ "$(git rev-parse origin/main)" != "$base_sha" ]]; then
             echo "::error::The control plane changed before persistence."

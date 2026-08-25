@@ -4,7 +4,8 @@
 
 This repository is a generic control plane for one scheduled batch job. The
 public files describe only the execution boundary. Application logic,
-configuration, state, and generated content are stored as encrypted data.
+configuration and state are stored as encrypted data. Selected scheduled
+deliverables are intentionally published under date-only names.
 
 ## Components
 
@@ -16,11 +17,13 @@ configuration, state, and generated content are stored as encrypted data.
    temporary directory and removed with the hosted runner.
 4. **Secret boundary** — decryption material and service credentials are read
    only from GitHub Actions Secrets. Local copies remain outside this repository.
-5. **Encrypted result** — deliverables and diagnostic data are encrypted before
-   they are uploaded as workflow artifacts.
-6. **Write-isolated state** — the secret-bearing execution job has read-only
-   repository access. A separate job receives only authenticated ciphertext and
-   may replace the opaque payload after a successful scheduled execution.
+5. **Encrypted run record** — the complete result and diagnostic data are
+   encrypted before they are uploaded as workflow artifacts.
+6. **Published output** — a successful scheduled execution contributes one
+   validated document pair to `output/`, using `YYYY-MM-DD` filenames.
+7. **Write-isolated persistence** — the secret-bearing execution job has
+   read-only repository access. A separate job receives authenticated state and
+   a validated output pair, then persists only those fixed paths.
 
 ## Execution Flow
 
@@ -34,6 +37,13 @@ checkout public control plane
 decrypt payload in runner temp space
           |
           v
+plan the canonical date and inspect the matching repository paths
+          |
+          +---- complete pair + matching state ---> no-op
+          |
+          +---- partial or inconsistent pair ----> stop
+          |
+          v
 execute private entrypoint with secret injection
           |
           +---- failure ---> encrypt diagnostics ---> short-lived artifact
@@ -41,23 +51,33 @@ execute private entrypoint with secret injection
           v
 validate private result
           |
-          +---- preview ---> encrypt result ---> short-lived artifact
+          +---- preview ---> encrypt result ---> short-lived artifact ---> stop
           |
           v
-authenticate and encrypt result + updated runtime state
+authenticate updated state and validate scheduled output
           |
           v
-upload encrypted artifact and hand opaque state to a write-only job
+bind paths and hashes to this run and its base revision
+          |
+          v
+hand the fixed file set to a secret-free write job
+          |
+          v
+commit updated state and date-named documents to main
 ```
 
 ## Public Information Policy
 
 - Documentation and workflow labels remain generic and English-only.
-- No credentials, domain inputs, private configuration, or output are stored in
+- No credentials, domain inputs, or private configuration are stored in
   plaintext.
+- Only the intended date-named files in `output/` are published as generated
+  content.
 - Workflow logs expose only generic lifecycle messages.
-- Artifacts are treated as publicly downloadable and are therefore encrypted
-  before upload.
+- Diagnostic artifacts and complete run records are encrypted before upload.
+- The scheduled handoff separates authenticated ciphertext from the two
+  plaintext files intended for publication. Both artifacts are tied to the
+  current run and retained for one day.
 - Manual dispatch is preview-only and cannot update repository state.
 - The scheduled workflow uses a standard hosted runner and does not run on push.
 
@@ -65,6 +85,8 @@ upload encrypted artifact and hand opaque state to a write-only job
 
 The runtime updates its encrypted state only after successful private
 validation, authenticated-encryption round-trip verification, and a base-revision
-check in the write-isolated job. A failed execution leaves the committed blob
-unchanged. Encrypted diagnostics can be downloaded and decrypted locally for
-investigation.
+check in the write-isolated job. The handoff is restricted to the current run,
+attempt, exact file sets, date-only paths, and recorded SHA-256 values. Existing
+date paths cannot be replaced. A failed or repeated execution leaves the
+committed state and output unchanged. Encrypted diagnostics can be downloaded
+and decrypted locally for investigation.

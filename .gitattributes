@@ -1,1 +1,3 @@
 payload/*.enc binary
+output/*.docx binary
+output/*.pdf binary
