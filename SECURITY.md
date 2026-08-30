@@ -13,4 +13,6 @@ repository history before continuing scheduled execution.
 
 The encrypted runtime and its pinned dependency metadata are trusted inputs.
 The write-isolated job has no runtime secrets. It receives authenticated state
-ciphertext and only the two files already intended for public output.
+ciphertext and only the two files already intended for public output. The
+post-persistence delivery job has read-only repository access and receives only
+its dedicated destination credential.

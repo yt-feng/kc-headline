@@ -4,6 +4,19 @@ on:
   schedule:
     - cron: "43 10 * * 5"
   workflow_dispatch:
+    inputs:
+      operation:
+        description: Manual operation
+        required: true
+        default: preview
+        type: choice
+        options:
+          - preview
+          - recover-missed-schedule
+      publication_date:
+        description: Friday date for an explicit recovery (YYYY-MM-DD)
+        required: false
+        type: string
 
 permissions: {}
 
@@ -23,8 +36,9 @@ jobs:
       state_digest: ${{ steps.handoff.outputs.state_digest }}
       document_digest: ${{ steps.handoff.outputs.document_digest }}
       pdf_digest: ${{ steps.handoff.outputs.pdf_digest }}
-      output_date: ${{ steps.handoff.outputs.output_date }}
+      output_date: ${{ steps.plan.outputs.output_date }}
       should_persist: ${{ steps.plan.outputs.should_persist }}
+      persist_requested: ${{ steps.plan.outputs.persist_requested }}
     steps:
       - name: Check out control plane
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -84,24 +98,54 @@ jobs:
         shell: bash
         env:
           JOB_EVENT: ${{ github.event_name }}
+          REQUESTED_OPERATION: ${{ github.event.inputs.operation || 'preview' }}
+          REQUESTED_DATE: ${{ github.event.inputs.publication_date || '' }}
         run: |
           set -euo pipefail
-          if [[ "$JOB_EVENT" != "schedule" ]]; then
-            echo "should_persist=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          persist_requested=false
+          if [[ "$JOB_EVENT" == "schedule" ]]; then
+            if [[ -n "$REQUESTED_DATE" ]]; then
+              echo "::error::Scheduled runs cannot override the publication date."
+              exit 1
+            fi
+            persist_requested=true
+          elif [[ "$REQUESTED_OPERATION" == "recover-missed-schedule" ]]; then
+            if [[ -z "$REQUESTED_DATE" ]]; then
+              echo "::error::An explicit recovery date is required."
+              exit 1
+            fi
+            persist_requested=true
+          elif [[ "$REQUESTED_OPERATION" != "preview" ]]; then
+            echo "::error::Unknown manual operation."
+            exit 1
           fi
 
+          publication_arguments=()
+          if [[ -n "$REQUESTED_DATE" ]]; then
+            publication_arguments=(--publication-date "$REQUESTED_DATE")
+          fi
           (
             cd "$RUNNER_TEMP/private-runtime"
-            python -m tools.private_batch --mode plan > "$RUNNER_TEMP/plan.json"
+            python -m tools.private_batch \
+              --mode plan \
+              "${publication_arguments[@]}" > "$RUNNER_TEMP/plan.json"
           )
-          plan_values="$(python - "$RUNNER_TEMP/plan.json" <<'PY'
+          plan_values="$(python - \
+            "$RUNNER_TEMP/plan.json" \
+            "$RUNNER_TEMP/private-runtime/state/issue.json" \
+            "$JOB_EVENT" \
+            "$REQUESTED_OPERATION" \
+            "$REQUESTED_DATE" <<'PY'
           import datetime as dt
           import json
           import pathlib
           import sys
 
           plan = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+          state = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+          event = sys.argv[3]
+          operation = sys.argv[4]
+          requested = sys.argv[5]
           if set(plan) != {"status", "mode", "publication_date", "already_published"}:
               raise SystemExit("unexpected plan schema")
           if plan["status"] != "ok" or plan["mode"] != "plan":
@@ -113,6 +157,18 @@ jobs:
           parsed = dt.date.fromisoformat(value)
           if parsed.isoformat() != value or parsed.weekday() != 4:
               raise SystemExit("non-canonical plan date")
+          if requested and requested != value:
+              raise SystemExit("requested date is not the canonical plan date")
+          if event == "workflow_dispatch" and operation == "recover-missed-schedule":
+              last_data = state.get("last_published") if isinstance(state, dict) else None
+              if state.get("schema_version") != 1 or not isinstance(last_data, dict):
+                  raise SystemExit("invalid persisted state")
+              last_date = dt.date.fromisoformat(str(last_data.get("publication_date") or ""))
+              if parsed not in {last_date, last_date + dt.timedelta(days=7)}:
+                  raise SystemExit("recovery must target the current or next unpublished Friday")
+              shanghai_today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).date()
+              if parsed > shanghai_today:
+                  raise SystemExit("recovery date is in the future")
           print(f"{value}|{'true' if published else 'false'}")
           PY
           )"
@@ -144,6 +200,12 @@ jobs:
           fi
 
           echo "output_date=$output_date" >> "$GITHUB_OUTPUT"
+          echo "persist_requested=$persist_requested" >> "$GITHUB_OUTPUT"
+          if [[ "$persist_requested" != "true" ]]; then
+            echo "should_persist=false" >> "$GITHUB_OUTPUT"
+            echo "run_batch=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [[ "$document_exists" == "true" && "$pdf_exists" == "true" ]]; then
             if [[ "$already_published" != "true" ]]; then
               echo "::error::The scheduled output is ahead of persisted state."
@@ -151,6 +213,7 @@ jobs:
             fi
             git ls-files --error-unmatch "$document_path" "$pdf_path" >/dev/null
             echo "should_persist=false" >> "$GITHUB_OUTPUT"
+            echo "run_batch=false" >> "$GITHUB_OUTPUT"
             echo "The scheduled output already exists."
             exit 0
           fi
@@ -163,16 +226,18 @@ jobs:
             exit 1
           fi
           echo "should_persist=true" >> "$GITHUB_OUTPUT"
+          echo "run_batch=true" >> "$GITHUB_OUTPUT"
 
       - name: Execute private batch
         id: execute
         if: >-
           success() &&
-          (github.event_name != 'schedule' || steps.plan.outputs.should_persist == 'true')
+          steps.plan.outputs.run_batch == 'true'
         shell: bash
         env:
           SERVICE_TOKEN: ${{ secrets.SERVICE_TOKEN }}
-          JOB_EVENT: ${{ github.event_name }}
+          PERSIST_REQUESTED: ${{ steps.plan.outputs.persist_requested }}
+          PLANNED_OUTPUT_DATE: ${{ steps.plan.outputs.output_date }}
           JOB_EXPORT_DIR: ${{ runner.temp }}/private-export
           JOB_STATE_DIR: ${{ runner.temp }}/private-runtime-next
         run: |
@@ -181,7 +246,7 @@ jobs:
             echo "::error::Required service credential is unavailable."
             exit 1
           fi
-          if [[ "$JOB_EVENT" == "schedule" ]]; then
+          if [[ "$PERSIST_REQUESTED" == "true" ]]; then
             export JOB_MODE="scheduled"
           else
             export JOB_MODE="preview"
@@ -190,7 +255,9 @@ jobs:
           set +e
           (
             cd "$RUNNER_TEMP/private-runtime"
-            python -m tools.private_batch --mode "$JOB_MODE"
+            python -m tools.private_batch \
+              --mode "$JOB_MODE" \
+              --publication-date "$PLANNED_OUTPUT_DATE"
           ) >"$RUNNER_TEMP/job.log" 2>&1
           status=$?
           set -e
@@ -275,7 +342,7 @@ jobs:
       - name: Prepare encrypted state handoff
         id: handoff
         if: >-
-          success() && github.event_name == 'schedule' &&
+          success() && steps.plan.outputs.persist_requested == 'true' &&
           steps.plan.outputs.should_persist == 'true'
         shell: bash
         env:
@@ -481,7 +548,7 @@ jobs:
 
       - name: Upload encrypted state handoff
         if: >-
-          success() && github.event_name == 'schedule' &&
+          success() && steps.plan.outputs.persist_requested == 'true' &&
           steps.plan.outputs.should_persist == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -492,7 +559,7 @@ jobs:
 
       - name: Upload scheduled output handoff
         if: >-
-          success() && github.event_name == 'schedule' &&
+          success() && steps.plan.outputs.persist_requested == 'true' &&
           steps.plan.outputs.should_persist == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
@@ -537,7 +604,8 @@ jobs:
     name: Persist validated batch
     needs: execute
     if: >-
-      github.event_name == 'schedule' && needs.execute.result == 'success' &&
+      needs.execute.result == 'success' &&
+      needs.execute.outputs.persist_requested == 'true' &&
       needs.execute.outputs.should_persist == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -765,3 +833,153 @@ jobs:
             exit 1
           fi
           git push origin HEAD:main
+
+  deliver:
+    name: Deliver validated batch
+    needs: [execute, persist]
+    if: >-
+      always() && needs.execute.result == 'success' &&
+      needs.execute.outputs.persist_requested == 'true' &&
+      (
+        (
+          needs.execute.outputs.should_persist == 'true' &&
+          needs.persist.result == 'success'
+        ) ||
+        (
+          needs.execute.outputs.should_persist == 'false' &&
+          needs.persist.result == 'skipped'
+        )
+      )
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out persisted control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Validate persisted output
+        shell: bash
+        env:
+          OUTPUT_DATE: ${{ needs.execute.outputs.output_date }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$OUTPUT_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+            echo "::error::Invalid delivery date."
+            exit 1
+          fi
+          document_path="output/$OUTPUT_DATE.docx"
+          pdf_path="output/$OUTPUT_DATE.pdf"
+          if [[ ! -f "$document_path" || -L "$document_path" \
+            || ! -f "$pdf_path" || -L "$pdf_path" ]]; then
+            echo "::error::The persisted output pair is unavailable."
+            exit 1
+          fi
+          git ls-files --error-unmatch "$document_path" "$pdf_path" >/dev/null
+          python - "$OUTPUT_DATE" "$document_path" "$pdf_path" <<'PY'
+          import datetime as dt
+          import pathlib
+          import sys
+          import zipfile
+
+          value = sys.argv[1]
+          document = pathlib.Path(sys.argv[2])
+          pdf = pathlib.Path(sys.argv[3])
+          parsed = dt.date.fromisoformat(value)
+          if parsed.isoformat() != value or parsed.weekday() != 4:
+              raise SystemExit("non-canonical delivery date")
+          if not zipfile.is_zipfile(document):
+              raise SystemExit("invalid document container")
+          with zipfile.ZipFile(document) as archive:
+              required = {"[Content_Types].xml", "word/document.xml"}
+              if not required.issubset(archive.namelist()) or archive.testzip() is not None:
+                  raise SystemExit("invalid document contents")
+          with pdf.open("rb") as handle:
+              if handle.read(5) != b"%PDF-":
+                  raise SystemExit("invalid portable document")
+          PY
+
+      - name: Prepare delivery runtime
+        shell: bash
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -z "${BUNDLE_KEY:-}" ]]; then
+            echo "::error::Required runtime material is unavailable."
+            exit 1
+          fi
+          printf '%s' "$BUNDLE_KEY" > "$RUNNER_TEMP/delivery-bundle.pass"
+          unset BUNDLE_KEY
+          python tools/envelope.py decrypt \
+            --context runtime \
+            --key-file "$RUNNER_TEMP/delivery-bundle.pass" \
+            --input payload/runtime.enc \
+            --output "$RUNNER_TEMP/delivery-runtime.tar.gz"
+          python tools/archive_guard.py \
+            --archive "$RUNNER_TEMP/delivery-runtime.tar.gz" \
+            --destination "$RUNNER_TEMP/delivery-runtime"
+          test -f "$RUNNER_TEMP/delivery-runtime/.runtime-ready"
+          test -f "$RUNNER_TEMP/delivery-runtime/kc_headline/delivery.py"
+          unlink "$RUNNER_TEMP/delivery-bundle.pass"
+
+      - name: Deliver persisted document
+        shell: bash
+        env:
+          DELIVERY_BASE_URL: ${{ vars.DELIVERY_BASE_URL }}
+          DELIVERY_BEARER_TOKEN: ${{ secrets.DELIVERY_BEARER_TOKEN }}
+          DELIVERY_SOURCE_REPO: ${{ github.repository }}
+          OUTPUT_DATE: ${{ needs.execute.outputs.output_date }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${DELIVERY_BASE_URL:-}" || -z "${DELIVERY_BEARER_TOKEN:-}" ]]; then
+            echo "::error::Required delivery configuration is unavailable."
+            exit 1
+          fi
+          set +e
+          PYTHONPATH="$RUNNER_TEMP/delivery-runtime" \
+            python -m kc_headline.delivery \
+              --repo-root "$GITHUB_WORKSPACE" \
+              --publication-date "$OUTPUT_DATE" \
+              --document "$GITHUB_WORKSPACE/output/$OUTPUT_DATE.docx" \
+              >"$RUNNER_TEMP/delivery.log" 2>&1
+          status=$?
+          set -e
+          python tools/secret_guard.py \
+            --environment DELIVERY_BEARER_TOKEN \
+            --path "$RUNNER_TEMP/delivery-runtime" \
+            --path "$RUNNER_TEMP/delivery.log"
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::Validated delivery failed."
+            exit "$status"
+          fi
+          echo "Validated delivery completed."
+
+      - name: Remove delivery workspace
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in "$RUNNER_TEMP/delivery-runtime"; do
+            if [[ -e "$target" ]]; then
+              find "$target" -depth -delete
+            fi
+          done
+          for target in \
+            "$RUNNER_TEMP/delivery-bundle.pass" \
+            "$RUNNER_TEMP/delivery-runtime.tar.gz" \
+            "$RUNNER_TEMP/delivery.log"; do
+            if [[ -f "$target" ]]; then
+              unlink "$target"
+            fi
+          done

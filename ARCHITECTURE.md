@@ -24,6 +24,9 @@ deliverables are intentionally published under date-only names.
 7. **Write-isolated persistence** — the secret-bearing execution job has
    read-only repository access. A separate job receives authenticated state and
    a validated output pair, then persists only those fixed paths.
+8. **Post-persistence delivery** — a separate read-only job validates the
+   committed pair and uses the encrypted runtime to perform one idempotent
+   downstream handoff.
 
 ## Execution Flow
 
@@ -64,6 +67,9 @@ hand the fixed file set to a secret-free write job
           |
           v
 commit updated state and date-named documents to main
+          |
+          v
+validate committed pair and perform idempotent delivery
 ```
 
 ## Public Information Policy
@@ -78,7 +84,8 @@ commit updated state and date-named documents to main
 - The scheduled handoff separates authenticated ciphertext from the two
   plaintext files intended for publication. Both artifacts are tied to the
   current run and retained for one day.
-- Manual dispatch is preview-only and cannot update repository state.
+- Manual dispatch defaults to preview. The explicit recovery operation is
+  limited to the current published Friday or the immediately following Friday.
 - The scheduled workflow uses a standard hosted runner and does not run on push.
 
 ## Recovery
@@ -89,4 +96,6 @@ check in the write-isolated job. The handoff is restricted to the current run,
 attempt, exact file sets, date-only paths, and recorded SHA-256 values. Existing
 date paths cannot be replaced. A failed or repeated execution leaves the
 committed state and output unchanged. Encrypted diagnostics can be downloaded
-and decrypted locally for investigation.
+and decrypted locally for investigation. A delivery can be retried against the
+same date without replacing its committed files or creating a second logical
+handoff.
