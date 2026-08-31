@@ -13,7 +13,9 @@ WORKFLOW = """
 - name: Deliver persisted document
   env:
     DELIVERY_BEARER_TOKEN: ${{ secrets.DELIVERY_BEARER_TOKEN }}
-  run: python tools/secret_guard.py --environment DELIVERY_BEARER_TOKEN
+  run: |
+    python -m pip install --disable-pip-version-check --quiet "$RUNNER_TEMP/delivery-runtime"
+    python tools/secret_guard.py --environment DELIVERY_BEARER_TOKEN
 """
 
 
@@ -35,6 +37,17 @@ class WorkflowGuardTests(unittest.TestCase):
     def test_requires_the_delivery_secret_boundary(self) -> None:
         with self.assertRaisesRegex(WorkflowContractError, "source-digest-workflow-incomplete"):
             validate_workflow(self._path(WORKFLOW.replace("--environment DELIVERY_BEARER_TOKEN", "deliver")))
+
+    def test_requires_delivery_runtime_dependencies(self) -> None:
+        with self.assertRaisesRegex(WorkflowContractError, "source-digest-workflow-incomplete"):
+            validate_workflow(
+                self._path(
+                    WORKFLOW.replace(
+                        'python -m pip install --disable-pip-version-check --quiet "$RUNNER_TEMP/delivery-runtime"',
+                        "python -m kc_headline.delivery",
+                    )
+                )
+            )
 
 
 if __name__ == "__main__":

@@ -918,6 +918,8 @@ jobs:
             --destination "$RUNNER_TEMP/delivery-runtime"
           test -f "$RUNNER_TEMP/delivery-runtime/.runtime-ready"
           test -f "$RUNNER_TEMP/delivery-runtime/kc_headline/delivery.py"
+          test -f "$RUNNER_TEMP/delivery-runtime/pyproject.toml"
+          python -m pip install --disable-pip-version-check --quiet "$RUNNER_TEMP/delivery-runtime"
           unlink "$RUNNER_TEMP/delivery-bundle.pass"
 
       - name: Deliver persisted document

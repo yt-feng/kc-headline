@@ -22,6 +22,7 @@ def validate_workflow(path: Path) -> None:
         "python -m tools.private_batch",
         "- name: Deliver persisted document",
         "DELIVERY_BEARER_TOKEN: ${{ secrets.DELIVERY_BEARER_TOKEN }}",
+        'python -m pip install --disable-pip-version-check --quiet "$RUNNER_TEMP/delivery-runtime"',
         "--environment DELIVERY_BEARER_TOKEN",
     )
     if any(value not in content for value in required):
