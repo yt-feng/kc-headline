@@ -51,6 +51,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Verify source digest workflow contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/workflow_guard.py --workflow .github/workflows/batch.yml
+
       - name: Prepare encrypted runtime
         id: prepare
         shell: bash
@@ -235,17 +241,12 @@ jobs:
           steps.plan.outputs.run_batch == 'true'
         shell: bash
         env:
-          SERVICE_TOKEN: ${{ secrets.SERVICE_TOKEN }}
           PERSIST_REQUESTED: ${{ steps.plan.outputs.persist_requested }}
           PLANNED_OUTPUT_DATE: ${{ steps.plan.outputs.output_date }}
           JOB_EXPORT_DIR: ${{ runner.temp }}/private-export
           JOB_STATE_DIR: ${{ runner.temp }}/private-runtime-next
         run: |
           set -euo pipefail
-          if [[ -z "${SERVICE_TOKEN:-}" ]]; then
-            echo "::error::Required service credential is unavailable."
-            exit 1
-          fi
           if [[ "$PERSIST_REQUESTED" == "true" ]]; then
             export JOB_MODE="scheduled"
           else
@@ -267,20 +268,6 @@ jobs:
             exit "$status"
           fi
           echo "Batch execution completed."
-
-      - name: Verify persistence boundary
-        if: steps.execute.outcome == 'success'
-        shell: bash
-        env:
-          SERVICE_TOKEN: ${{ secrets.SERVICE_TOKEN }}
-        run: |
-          set -euo pipefail
-          python tools/secret_guard.py \
-            --environment SERVICE_TOKEN \
-            --path "$RUNNER_TEMP/private-runtime" \
-            --path "$RUNNER_TEMP/private-export" \
-            --path "$RUNNER_TEMP/private-runtime-next" \
-            --path "$RUNNER_TEMP/job.log"
 
       - name: Encrypt result and diagnostics
         id: package
