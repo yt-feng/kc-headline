@@ -1,0 +1,343 @@
+name: Localized Batch
+
+on:
+  schedule:
+    - cron: "43 11 * * 5"
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Manual operation
+        required: true
+        default: preview
+        type: choice
+        options:
+          - preview
+          - recover-missed-schedule
+      publication_date:
+        description: Friday date for an explicit recovery (YYYY-MM-DD)
+        required: false
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: scheduled-batch-main
+  queue: max
+
+jobs:
+  execute:
+    name: Execute encrypted localized batch
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      base_sha: ${{ steps.handoff.outputs.base_sha }}
+      handoff_digest: ${{ steps.handoff.outputs.handoff_digest }}
+      output_date: ${{ steps.plan.outputs.output_date }}
+      should_persist: ${{ steps.plan.outputs.should_persist }}
+      persist_requested: ${{ steps.plan.outputs.persist_requested }}
+    steps:
+      - name: Check out control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: "3.11"
+
+      - name: Verify localized workflow contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tools/localized_guard.py workflow --workflow .github/workflows/localized.yml
+
+      - name: Prepare encrypted runtime
+        id: prepare
+        shell: bash
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -z "${BUNDLE_KEY:-}" ]]; then
+            echo "::error::Required runtime material is unavailable."
+            exit 1
+          fi
+          printf '%s' "$BUNDLE_KEY" > "$RUNNER_TEMP/localized.pass"
+          unset BUNDLE_KEY
+          mkdir -p "$RUNNER_TEMP/localized-runtime"
+          set +e
+          (
+            set -euo pipefail
+            python tools/envelope.py decrypt --context runtime \
+              --key-file "$RUNNER_TEMP/localized.pass" \
+              --input payload/localized.enc --output "$RUNNER_TEMP/localized.tar.gz"
+            python tools/archive_guard.py --archive "$RUNNER_TEMP/localized.tar.gz" \
+              --destination "$RUNNER_TEMP/localized-runtime"
+            test -f "$RUNNER_TEMP/localized-runtime/.runtime-ready"
+            test -f "$RUNNER_TEMP/localized-runtime/tools/chinese_batch.py"
+            test -f "$RUNNER_TEMP/localized-runtime/tools/prepare_system.sh"
+            test -f "$RUNNER_TEMP/localized-runtime/pyproject.toml"
+            unlink "$RUNNER_TEMP/localized.pass"
+            sudo bash "$RUNNER_TEMP/localized-runtime/tools/prepare_system.sh"
+            python -m pip install --disable-pip-version-check --quiet "$RUNNER_TEMP/localized-runtime"
+          ) >"$RUNNER_TEMP/localized-prepare.log" 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::Runtime preparation failed."
+            exit "$status"
+          fi
+
+      - name: Plan repository update
+        id: plan
+        shell: bash
+        env:
+          JOB_EVENT: ${{ github.event_name }}
+          REQUESTED_OPERATION: ${{ github.event.inputs.operation || 'preview' }}
+          REQUESTED_DATE: ${{ github.event.inputs.publication_date || '' }}
+        run: |
+          set -euo pipefail
+          publication_arguments=()
+          if [[ -n "$REQUESTED_DATE" ]]; then
+            publication_arguments=(--publication-date "$REQUESTED_DATE")
+          fi
+          set +e
+          (
+            cd "$RUNNER_TEMP/localized-runtime"
+            python -m tools.chinese_batch --mode plan \
+              "${publication_arguments[@]}" > "$RUNNER_TEMP/localized-plan.json"
+          ) >"$RUNNER_TEMP/localized-plan.log" 2>&1
+          status=$?
+          set -e
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::Batch planning failed."
+            exit "$status"
+          fi
+          python tools/localized_guard.py plan \
+            --plan "$RUNNER_TEMP/localized-plan.json" \
+            --state "$RUNNER_TEMP/localized-runtime/state/issue.json" \
+            --repo "$GITHUB_WORKSPACE" --github-output "$GITHUB_OUTPUT" \
+            --event "$JOB_EVENT" --operation "$REQUESTED_OPERATION" \
+            --requested-date "$REQUESTED_DATE"
+
+      - name: Execute localized batch
+        id: execute
+        if: success() && steps.plan.outputs.run_batch == 'true'
+        shell: bash
+        env:
+          SERVICE_TOKEN: ${{ secrets.SERVICE_TOKEN }}
+          PERSIST_REQUESTED: ${{ steps.plan.outputs.persist_requested }}
+          OUTPUT_DATE: ${{ steps.plan.outputs.output_date }}
+          JOB_EXPORT_DIR: ${{ runner.temp }}/localized-export
+          JOB_STATE_DIR: ${{ runner.temp }}/localized-runtime-next
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -z "${SERVICE_TOKEN:-}" ]]; then
+            echo "::error::Required service credential is unavailable."
+            exit 1
+          fi
+          mode=preview
+          if [[ "$PERSIST_REQUESTED" == "true" ]]; then
+            mode=scheduled
+          fi
+          mkdir -p "$JOB_EXPORT_DIR"
+          set +e
+          (
+            cd "$RUNNER_TEMP/localized-runtime"
+            python -m tools.chinese_batch --mode "$mode" --publication-date "$OUTPUT_DATE"
+          ) >"$RUNNER_TEMP/localized-job.log" 2>&1
+          status=$?
+          set -e
+          python tools/secret_guard.py --environment SERVICE_TOKEN \
+            --path "$RUNNER_TEMP/localized-runtime" \
+            --path "$RUNNER_TEMP/localized-runtime-next" \
+            --path "$RUNNER_TEMP/localized-export" \
+            --path "$RUNNER_TEMP/localized-job.log"
+          if [[ "$status" -ne 0 ]]; then
+            echo "::error::Batch execution failed. Download the encrypted diagnostic artifact."
+            exit "$status"
+          fi
+          echo "Batch execution completed."
+
+      - name: Encrypt result and diagnostics
+        id: package
+        if: always()
+        shell: bash
+        env:
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+          PREPARE_OUTCOME: ${{ steps.prepare.outcome }}
+          EXECUTE_OUTCOME: ${{ steps.execute.outcome }}
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -z "${BUNDLE_KEY:-}" ]]; then
+            echo "::error::Result encryption material is unavailable."
+            exit 1
+          fi
+          printf '%s' "$BUNDLE_KEY" > "$RUNNER_TEMP/localized.pass"
+          unset BUNDLE_KEY
+          mkdir -p "$RUNNER_TEMP/localized-result" artifacts
+          for source in localized-prepare.log localized-plan.log localized-job.log; do
+            if [[ -f "$RUNNER_TEMP/$source" ]]; then
+              cp "$RUNNER_TEMP/$source" "$RUNNER_TEMP/localized-result/$source"
+            fi
+          done
+          if [[ -d "$RUNNER_TEMP/localized-export" ]]; then
+            cp -R "$RUNNER_TEMP/localized-export" "$RUNNER_TEMP/localized-result/output"
+          fi
+          {
+            echo "prepare=$PREPARE_OUTCOME"
+            echo "execute=$EXECUTE_OUTCOME"
+            echo "run_id=$GITHUB_RUN_ID"
+            echo "run_attempt=$GITHUB_RUN_ATTEMPT"
+          } > "$RUNNER_TEMP/localized-result/status.txt"
+          tar -czf "$RUNNER_TEMP/localized-result.tar.gz" -C "$RUNNER_TEMP/localized-result" .
+          python tools/envelope.py encrypt --context result \
+            --key-file "$RUNNER_TEMP/localized.pass" \
+            --input "$RUNNER_TEMP/localized-result.tar.gz" --output artifacts/localized-result.enc
+          python tools/envelope.py decrypt --context result \
+            --key-file "$RUNNER_TEMP/localized.pass" \
+            --input artifacts/localized-result.enc --output "$RUNNER_TEMP/localized-result.verify.tar.gz"
+          cmp -s "$RUNNER_TEMP/localized-result.tar.gz" "$RUNNER_TEMP/localized-result.verify.tar.gz"
+
+      - name: Upload encrypted diagnostic artifact
+        if: always() && steps.package.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: localized-result-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/localized-result.enc
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Prepare authenticated publication handoff
+        id: handoff
+        if: >-
+          success() && steps.plan.outputs.persist_requested == 'true' &&
+          steps.plan.outputs.should_persist == 'true'
+        shell: bash
+        env:
+          OUTPUT_DATE: ${{ steps.plan.outputs.output_date }}
+        run: |
+          set -euo pipefail
+          umask 077
+          test -f "$RUNNER_TEMP/localized-runtime-next/.runtime-ready"
+          tar -czf "$RUNNER_TEMP/localized.next.tar.gz" -C "$RUNNER_TEMP/localized-runtime-next" .
+          python tools/envelope.py encrypt --context runtime \
+            --key-file "$RUNNER_TEMP/localized.pass" \
+            --input "$RUNNER_TEMP/localized.next.tar.gz" --output "$RUNNER_TEMP/localized.next.enc"
+          python tools/envelope.py decrypt --context runtime \
+            --key-file "$RUNNER_TEMP/localized.pass" \
+            --input "$RUNNER_TEMP/localized.next.enc" --output "$RUNNER_TEMP/localized.next.verify.tar.gz"
+          cmp -s "$RUNNER_TEMP/localized.next.tar.gz" "$RUNNER_TEMP/localized.next.verify.tar.gz"
+          python tools/archive_guard.py --archive "$RUNNER_TEMP/localized.next.verify.tar.gz" \
+            --destination "$RUNNER_TEMP/localized-next-verify"
+          python tools/localized_guard.py handoff \
+            --repo "$GITHUB_WORKSPACE" --export "$RUNNER_TEMP/localized-export" \
+            --next-runtime "$RUNNER_TEMP/localized-next-verify" \
+            --ciphertext "$RUNNER_TEMP/localized.next.enc" \
+            --handoff "$RUNNER_TEMP/localized-handoff" --github-output "$GITHUB_OUTPUT" \
+            --output-date "$OUTPUT_DATE" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+
+      - name: Upload fixed publication handoff
+        if: >-
+          success() && steps.plan.outputs.persist_requested == 'true' &&
+          steps.plan.outputs.should_persist == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: localized-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/localized-handoff
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Remove plaintext workspace
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for target in \
+            "$RUNNER_TEMP/localized-runtime" \
+            "$RUNNER_TEMP/localized-runtime-next" \
+            "$RUNNER_TEMP/localized-export" \
+            "$RUNNER_TEMP/localized-result" \
+            "$RUNNER_TEMP/localized-handoff" \
+            "$RUNNER_TEMP/localized-next-verify"; do
+            if [[ -d "$target" && ! -L "$target" ]]; then
+              find "$target" -depth -delete
+            fi
+          done
+          for target in \
+            "$RUNNER_TEMP/localized.pass" \
+            "$RUNNER_TEMP/localized.tar.gz" \
+            "$RUNNER_TEMP/localized.next.tar.gz" \
+            "$RUNNER_TEMP/localized.next.enc" \
+            "$RUNNER_TEMP/localized.next.verify.tar.gz" \
+            "$RUNNER_TEMP/localized-result.tar.gz" \
+            "$RUNNER_TEMP/localized-result.verify.tar.gz" \
+            "$RUNNER_TEMP/localized-plan.json" \
+            "$RUNNER_TEMP/localized-prepare.log" \
+            "$RUNNER_TEMP/localized-plan.log" \
+            "$RUNNER_TEMP/localized-job.log"; do
+            if [[ -f "$target" ]]; then
+              unlink "$target"
+            fi
+          done
+
+  persist:
+    name: Persist validated localized batch
+    needs: execute
+    if: >-
+      needs.execute.result == 'success' &&
+      needs.execute.outputs.persist_requested == 'true' &&
+      needs.execute.outputs.should_persist == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Check out current control plane
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Download fixed publication handoff
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: localized-handoff-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/localized-handoff-in
+
+      - name: Validate and persist fixed publication
+        shell: bash
+        env:
+          BASE_SHA: ${{ needs.execute.outputs.base_sha }}
+          HANDOFF_DIGEST: ${{ needs.execute.outputs.handoff_digest }}
+          OUTPUT_DATE: ${{ needs.execute.outputs.output_date }}
+        run: |
+          set -euo pipefail
+          handoff_arguments=(
+            --repo "$GITHUB_WORKSPACE" --handoff "$RUNNER_TEMP/localized-handoff-in"
+            --base-sha "$BASE_SHA" --handoff-digest "$HANDOFF_DIGEST"
+            --output-date "$OUTPUT_DATE" --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT"
+          )
+          python tools/localized_guard.py persist "${handoff_arguments[@]}"
+          git add payload/localized.enc "output/zh/$OUTPUT_DATE.docx" "output/zh/$OUTPUT_DATE.pdf"
+          python tools/localized_guard.py staged "${handoff_arguments[@]}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "chore: publish localized batch"
+          git fetch origin main
+          python tools/localized_guard.py rebase-check \
+            --repo "$GITHUB_WORKSPACE" --base-sha "$BASE_SHA" \
+            --target origin/main --output-date "$OUTPUT_DATE"
+          git rebase origin/main
+          python tools/localized_guard.py committed "${handoff_arguments[@]}"
+          git push origin HEAD:main

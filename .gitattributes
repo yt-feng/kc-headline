@@ -1,3 +1,5 @@
 payload/*.enc binary
 output/*.docx binary
 output/*.pdf binary
+output/zh/*.docx binary
+output/zh/*.pdf binary
