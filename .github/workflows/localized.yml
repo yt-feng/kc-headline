@@ -86,6 +86,8 @@ jobs:
             unlink "$RUNNER_TEMP/localized.pass"
             sudo bash "$RUNNER_TEMP/localized-runtime/tools/prepare_system.sh"
             python -m pip install --disable-pip-version-check --quiet "$RUNNER_TEMP/localized-runtime"
+            cd "$RUNNER_TEMP/localized-runtime"
+            python -m tools.private_regressions
           ) >"$RUNNER_TEMP/localized-prepare.log" 2>&1
           status=$?
           set -e
@@ -161,7 +163,7 @@ jobs:
             --path "$RUNNER_TEMP/localized-export" \
             --path "$RUNNER_TEMP/localized-job.log"
           if [[ "$status" -ne 0 ]]; then
-            echo "::error::Batch execution failed. Download the encrypted diagnostic artifact."
+            echo "::error::Batch execution failed. Inspect this run with the cloud diagnostic workflow."
             exit "$status"
           fi
           echo "Batch execution completed."

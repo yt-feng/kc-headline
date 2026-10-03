@@ -90,6 +90,8 @@ jobs:
             unlink "$RUNNER_TEMP/bundle.pass"
             sudo bash "$RUNNER_TEMP/private-runtime/tools/prepare_system.sh"
             python -m pip install --disable-pip-version-check --quiet "$RUNNER_TEMP/private-runtime"
+            cd "$RUNNER_TEMP/private-runtime"
+            python -m tools.private_regressions
           ) >"$RUNNER_TEMP/prepare.log" 2>&1
           status=$?
           set -e
@@ -264,7 +266,7 @@ jobs:
           set -e
           echo "status=$status" >> "$GITHUB_OUTPUT"
           if [[ "$status" -ne 0 ]]; then
-            echo "::error::Batch execution failed. Download the encrypted diagnostic artifact."
+            echo "::error::Batch execution failed. Inspect this run with the cloud diagnostic workflow."
             exit "$status"
           fi
           echo "Batch execution completed."
