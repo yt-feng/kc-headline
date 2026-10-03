@@ -73,6 +73,7 @@ class InspectionTests(unittest.TestCase):
                 "paragraph 2 contains numbers absent from its selected evidence: ['2026', '12345678901234567890', '-5%']",
                 private],
             'revision_history': [{'gate': 'deterministic_compilation',
+                'private_terminal_snapshot': {'source_window': private, 'draft': {'body_paragraphs': [private]}, 'evidence_catalog': {'private-id': private}, 'terminal': True},
                 'errors': ['has too few paragraphs: 6; minimum is 8'],
                 'length_repair': {'current_chars': 1600, 'gate_min_chars': 2300,
                     'generation_target_chars': 3600, 'unused_evidence_span_hints': [{'id': private, 'exact_quote': private}]},
