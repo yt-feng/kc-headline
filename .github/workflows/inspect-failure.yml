@@ -1,0 +1,42 @@
+name: Inspect encrypted failure
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Failed main batch run to inspect
+        type: string
+        required: true
+permissions: {}
+jobs:
+  inspect:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.11'
+      - name: Verify diagnostic tests
+        run: python -m unittest tools.test_inspect_failure
+      - name: Inspect authenticated records
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUNDLE_KEY: ${{ secrets.BUNDLE_KEY }}
+          INSPECT_RUN_ID: ${{ inputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          [[ "$INSPECT_RUN_ID" =~ ^[1-9][0-9]{0,19}$ ]]
+          test -n "$BUNDLE_KEY"
+          key_file="$RUNNER_TEMP/diagnostic.key"
+          trap 'rm -f "$key_file"' EXIT
+          printf '%s' "$BUNDLE_KEY" > "$key_file"
+          unset BUNDLE_KEY
+          python -m tools.inspect_failure --run-id "$INSPECT_RUN_ID" --key-file "$key_file"
