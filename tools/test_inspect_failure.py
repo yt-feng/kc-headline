@@ -205,5 +205,29 @@ class InspectionTests(unittest.TestCase):
         ), self.assertRaises(Exception):
             inspect(123, key)
 
+
+class TerminalShapeTests(unittest.TestCase):
+    def test_exact_private_draft_only_emits_shape_and_feasibility(self):
+        from tools.inspect_failure import terminal_shape
+        import hashlib
+        secret='private-sentinel secret text https://private.invalid?token=hidden'
+        draft={'body_paragraphs':[secret]*27,'paragraph_evidence_ids':[['private-span']]*27}
+        snapshot={'schema_version':1,'terminal':True,'draft_complete':True,'draft':draft,
+            'draft_sha256':hashlib.sha256(json.dumps(draft,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()}
+        result=terminal_shape(snapshot)
+        self.assertEqual(result['paragraph_count'],27)
+        self.assertEqual(result['minimum_adjacent_groups_with_all_evidence'],1)
+        for value in ('private-sentinel','private-span','private.invalid','hidden'):
+            self.assertNotIn(value,json.dumps(result))
+        snapshot['draft_sha256']='a'*64
+        self.assertIsNone(terminal_shape(snapshot))
+
+    def test_all_citations_remain_in_the_partition_bound(self):
+        from tools.inspect_failure import terminal_shape
+        import hashlib
+        draft={'body_paragraphs':['text']*27,'paragraph_evidence_ids':[[f'private-{i}-{j}' for j in range(3)] for i in range(27)]}
+        snapshot={'schema_version':1,'terminal':True,'draft_complete':True,'draft':draft,'draft_sha256':hashlib.sha256(json.dumps(draft,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()}
+        self.assertEqual(terminal_shape(snapshot)['minimum_adjacent_groups_with_all_evidence'],27)
+
 if __name__ == '__main__':
     unittest.main()
