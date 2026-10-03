@@ -1,6 +1,7 @@
 """Inspect an authenticated failed run in Actions; publish only fixed codes/counts."""
 from __future__ import annotations
 import argparse
+import ast
 import hashlib
 import io
 import json
@@ -52,6 +53,136 @@ PATTERNS = {
 }
 PHASES = {'generate', 'validate', 'environment', 'internal', 'issue', 'runtime', 'plan', 'manifest-contract', 'generation', 'strict-validation', 'editorial', 'quality', 'render', 'artifact-validation'}
 
+GATES = {'deterministic_compilation', 'evidence_catalog', 'source_evidence', 'independent_factcheck'}
+NUMBER_LITERAL = re.compile(r'[+\-−]?(?:\d{4}-\d{1,2}-\d{1,2}|\d+(?:,\d{3})*(?:\.\d+)?%?)')
+
+
+def bounded_int(value, maximum=100000):
+    return value if type(value) is int and 0 <= value <= maximum else None
+
+
+def number_shape(value):
+    """Describe a numeric literal without publishing its private value."""
+    if not isinstance(value, str) or len(value) > 64 or not NUMBER_LITERAL.fullmatch(value):
+        return {'kind': 'invalid'}
+    unsigned = value.lstrip('+-−').replace(',', '')
+    kind = ('date' if re.fullmatch(r'\d{4}-\d{1,2}-\d{1,2}', unsigned)
+            else 'percent' if unsigned.endswith('%')
+            else 'year_like' if re.fullmatch(r'(?:18|19|20|21)\d{2}', unsigned)
+            else 'decimal' if '.' in unsigned else 'integer')
+    return {'kind': kind, 'negative': value.startswith(('-', '−')), 'digits': sum(c.isdigit() for c in value)}
+
+
+def numeric_rule(code, paragraph, literal_list):
+    row = {'rule': code}
+    if paragraph is not None:
+        row['paragraph'] = int(paragraph)
+    try:
+        values = ast.literal_eval(literal_list) if len(literal_list) <= 2048 else None
+    except (ValueError, SyntaxError, RecursionError):
+        values = None
+    if isinstance(values, list) and len(values) <= 32 and all(isinstance(v, str) for v in values):
+        row['unsupported_count'] = len(values)
+        row['number_shapes'] = [number_shape(v) for v in values]
+    else:
+        row['invalid_numeric_list'] = True
+    return row
+
+
+def rule_details(error):
+    """Parse only fixed rule grammar. Never echo unrecognized strings or identifiers."""
+    if not isinstance(error, str) or len(error) > 4096:
+        return {'rule': 'UNKNOWN'}
+    for pattern, code, names in (
+        (r'body is too short: ([0-9]{1,6}) chars; minimum is ([0-9]{1,6})', 'BODY_TOO_SHORT', ('actual', 'minimum')),
+        (r'has too few paragraphs: ([0-9]{1,6}); minimum is ([0-9]{1,6})', 'PARAGRAPHS_TOO_FEW', ('actual', 'minimum')),
+        (r'has too many paragraphs: ([0-9]{1,6}); maximum is ([0-9]{1,6})', 'PARAGRAPHS_TOO_MANY', ('actual', 'maximum')),
+    ):
+        match = re.fullmatch(pattern, error)
+        if match:
+            return {'rule': code, **dict(zip(names, map(int, match.groups()))) }
+    match = re.fullmatch(r'paragraph ([0-9]{1,3}) contains numbers absent from its selected evidence: (.+)', error)
+    if match:
+        return numeric_rule('PARAGRAPH_NUMBERS', match[1], match[2])
+    match = re.fullmatch(r'contains numbers absent from the source: (.+)', error)
+    if match:
+        return numeric_rule('SOURCE_NUMBERS', None, match[1])
+    match = re.fullmatch(r'paragraph ([0-9]{1,3}) lacks exact source evidence \(1-3 quotes, each 20-([0-9]{1,6}) characters\)', error)
+    if match:
+        return {'rule': 'PARAGRAPH_EVIDENCE_BINDING', 'paragraph': int(match[1]), 'maximum_quote_chars': int(match[2])}
+    fixed = {
+        'requires 1 to 3 key points': 'KEY_POINT_COUNT',
+        'whole-article evidence does not match its source span IDs': 'SOURCE_SPAN_BINDING',
+        'has insufficient exact source evidence quotes': 'SOURCE_EVIDENCE_COUNT',
+        'paragraph evidence does not align with body paragraphs': 'PARAGRAPH_EVIDENCE_ALIGNMENT',
+        'paragraph source span IDs do not align with body paragraphs': 'PARAGRAPH_SPAN_ALIGNMENT',
+        'Compilation paragraph evidence must align with body paragraphs': 'CATALOG_ALIGNMENT',
+        'Compilation paragraph evidence contains an invalid catalog ID': 'CATALOG_ID',
+        'insufficient_source_evidence': 'SOURCE_EVIDENCE_INSUFFICIENT',
+    }
+    return {'rule': fixed.get(error, 'UNKNOWN')}
+
+
+def revision_details(revision):
+    if not isinstance(revision, dict):
+        return {}
+    row = {}
+    if revision.get('gate') in GATES:
+        row['gate'] = revision['gate']
+    errors = revision.get('errors')
+    if isinstance(errors, list):
+        row['rules'] = [rule_details(error) for error in errors[:20]]
+    repair = revision.get('length_repair')
+    if isinstance(repair, dict):
+        measured = {}
+        for name in ('current_chars', 'gate_min_chars', 'generation_target_chars', 'required_additional_chars',
+                     'current_paragraph_count', 'remaining_paragraph_slots', 'target_paragraph_count',
+                     'target_body_paragraph_chars'):
+            value = bounded_int(repair.get(name))
+            if value is not None:
+                measured[name] = value
+        hints = repair.get('unused_evidence_span_hints')
+        if isinstance(hints, list):
+            measured['unused_span_hint_count'] = min(len(hints), 100000)
+        if measured:
+            row['length_repair'] = measured
+    hints = revision.get('evidence_span_hints')
+    if isinstance(hints, list):
+        numeric_hints = []
+        for hint in hints[:20]:
+            if not isinstance(hint, dict):
+                continue
+            measured = {'number_shape': number_shape(hint.get('compiled_number'))}
+            for name in ('paragraph', 'selected_span_count', 'maximum_span_count'):
+                value = bounded_int(hint.get(name))
+                if value is not None:
+                    measured[name] = value
+            matches = hint.get('matching_span_ids')
+            if isinstance(matches, list):
+                measured['matching_span_count'] = min(len(matches), 100000)
+            numeric_hints.append(measured)
+        row['numeric_hints'] = numeric_hints
+    return row
+
+
+def compilation_details(trigger, context):
+    if not isinstance(trigger, dict):
+        return None
+    row = {'context': context}
+    if trigger.get('terminal_gate') in GATES:
+        row['terminal_gate'] = trigger['terminal_gate']
+    for name in ('compile_attempts', 'rewrite_count', 'factcheck_attempts'):
+        value = bounded_int(trigger.get(name))
+        if value is not None:
+            row[name] = value
+    errors = trigger.get('terminal_errors')
+    if isinstance(errors, list):
+        row['terminal_rules'] = [rule_details(error) for error in errors[:20]]
+    revisions = trigger.get('revision_history')
+    if isinstance(revisions, list):
+        row['revisions'] = [revision_details(revision) for revision in revisions[:8]]
+    return row
+
 def summarize_text(value: str) -> dict:
     return {code: len(re.findall(pattern, value, re.I)) for code, pattern in PATTERNS.items()
             if re.search(pattern, value, re.I)}
@@ -61,7 +192,7 @@ def manifest_details(data: dict) -> dict:
     details = {}
     failure = data.get('failure', {})
     failure = failure if isinstance(failure, dict) else {}
-    allowed_types = {'ArtifactError', 'LLMError', 'DeterministicCompilationExhausted',
+    allowed_types = {'ArtifactError', 'LLMError', 'DeterministicCompilationExhausted', 'SourceEvidenceInsufficient',
                      'FactCheckError', 'SourceDigestError', 'PDFExportError', 'ValueError'}
     if failure.get('type') in allowed_types:
         details['failure_type'] = failure['type']
@@ -71,12 +202,32 @@ def manifest_details(data: dict) -> dict:
     if isinstance(fallback, dict):
         status = fallback.get('status')
         allowed = {'not_triggered', 'applied', 'limit_exhausted', 'replacement_failed',
-                   'no_eligible_candidates', 'failed_candidate_binding_mismatch', 'no_candidates'}
+                   'no_eligible_candidates', 'failed_candidate_binding_mismatch', 'no_candidates', 'no_valid_replacement'}
         details['fallback_status'] = status if status in allowed else 'other'
         for field in ('attempts', 'limit', 'evaluated_candidates', 'eligible_candidates'):
             value = fallback.get(field)
             if type(value) is int and 0 <= value <= 100000:
                 details['fallback_' + field] = value
+        records = []
+        events = fallback.get('events')
+        if isinstance(events, list):
+            for event in events[:5]:
+                if not isinstance(event, dict):
+                    continue
+                row = compilation_details(event.get('trigger'), 'fallback_event')
+                if row is not None:
+                    attempt = bounded_int(event.get('attempts'))
+                    if attempt is not None:
+                        row['fallback_attempt'] = attempt
+                    records.append(row)
+        for field in ('terminal_failure', 'replacement_failure'):
+            value = fallback.get(field)
+            if isinstance(value, dict):
+                row = compilation_details(value.get('terminal'), field)
+                if row is not None:
+                    records.append(row)
+        if records:
+            details['compilation_records'] = records
     quality = data.get('quality', {})
     errors = quality.get('errors', []) if isinstance(quality, dict) else []
     # Decode strings before matching lengths; JSON escaping can hide punctuation.

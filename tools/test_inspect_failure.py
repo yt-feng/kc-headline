@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from tools.envelope import encrypt
-from tools.inspect_failure import inspect, summarize_archive, manifest_details
+from tools.inspect_failure import inspect, summarize_archive, manifest_details, rule_details
 import zipfile
 
 class InspectionTests(unittest.TestCase):
@@ -63,6 +63,80 @@ class InspectionTests(unittest.TestCase):
         self.assertEqual(result['body_lengths'], [{'actual': 201, 'minimum': 900}])
         self.assertNotIn('private', json.dumps(result))
         self.assertNotIn('confi', json.dumps(result))
+
+    def test_structured_terminal_diagnostics_keep_original_text_and_numbers_private(self):
+        private = 'secret-private-title https://private.invalid?token=secret'
+        trigger = {
+            'section': 'private-section-sentinel', 'candidate_id': private, 'terminal_gate': 'deterministic_compilation',
+            'compile_attempts': 3, 'rewrite_count': 2, 'factcheck_attempts': 0,
+            'terminal_errors': ['body is too short: 1800 chars; minimum is 2300',
+                "paragraph 2 contains numbers absent from its selected evidence: ['2026', '12345678901234567890', '-5%']",
+                private],
+            'revision_history': [{'gate': 'deterministic_compilation',
+                'errors': ['has too few paragraphs: 6; minimum is 8'],
+                'length_repair': {'current_chars': 1600, 'gate_min_chars': 2300,
+                    'generation_target_chars': 3600, 'unused_evidence_span_hints': [{'id': private, 'exact_quote': private}]},
+                'evidence_span_hints': [{'paragraph': 2, 'compiled_number': '2026',
+                    'selected_span_count': 3, 'maximum_span_count': 3,
+                    'matching_span_ids': [private, private], 'matching_spans': [{'exact_quote': private}]}]}],
+        }
+        value = {'selection': {'selection_audit': {'fallback': {
+            'status': 'limit_exhausted', 'attempts': 5, 'limit': 5,
+            'events': [{'attempts': 1, 'trigger': trigger}],
+            'terminal_failure': {'message': private, 'terminal': trigger},
+        }}}}
+        result = manifest_details(value)
+        records = result['compilation_records']
+        self.assertEqual(len(records), 2)
+        self.assertNotIn('section', records[0])
+        self.assertEqual(records[0]['terminal_rules'][0], {'rule': 'BODY_TOO_SHORT', 'actual': 1800, 'minimum': 2300})
+        self.assertEqual(records[0]['terminal_rules'][1]['unsupported_count'], 3)
+        self.assertEqual([row['kind'] for row in records[0]['terminal_rules'][1]['number_shapes']], ['year_like', 'integer', 'percent'])
+        revision = records[0]['revisions'][0]
+        self.assertEqual(revision['numeric_hints'][0]['matching_span_count'], 2)
+        self.assertEqual(revision['length_repair']['unused_span_hint_count'], 1)
+        public = json.dumps(result)
+        for text in (private, 'private-section-sentinel', 'private.invalid', 'exact_quote', '2026', '12345678901234567890', '-5%'):
+            self.assertNotIn(text, public)
+
+    def test_unknown_rules_and_numeric_payloads_are_not_echoed(self):
+        for error in ('body is too short: private story',
+                      "paragraph 2 contains numbers absent from its selected evidence: ['private-secret']",
+                      "contains numbers absent from the source: {'private-secret': 'credential'}",
+                      None):
+            result = rule_details(error)
+            self.assertNotIn('private-secret', json.dumps(result))
+            self.assertNotIn('credential', json.dumps(result))
+
+    def test_terminal_record_fields_have_strict_types_and_bounds(self):
+        trigger = {'section': 'private-secret', 'terminal_gate': 'private-secret',
+            'compile_attempts': True, 'rewrite_count': -1, 'factcheck_attempts': 100001,
+            'terminal_errors': ['private-secret'] * 30,
+            'revision_history': [{'length_repair': {'current_chars': True}}] * 12}
+        result = manifest_details({'selection': {'selection_audit': {'fallback': {
+            'events': [{'trigger': trigger}] * 12}}}})
+        self.assertEqual(len(result['compilation_records']), 5)
+        row = result['compilation_records'][0]
+        self.assertEqual(len(row['terminal_rules']), 20)
+        self.assertEqual(len(row['revisions']), 8)
+        for key in ('compile_attempts', 'rewrite_count', 'factcheck_attempts', 'section', 'terminal_gate'):
+            self.assertNotIn(key, row)
+        self.assertNotIn('private-secret', json.dumps(result))
+
+    def test_archive_exposes_terminal_trigger_rule_measurements(self):
+        value = {'failure': {'type': 'DeterministicCompilationExhausted', 'phase': 'editorial'},
+            'selection': {'selection_audit': {'fallback': {'status': 'limit_exhausted',
+                'replacement_failure': {'terminal': {'terminal_gate': 'deterministic_compilation',
+                    'terminal_errors': ['has too many paragraphs: 19; maximum is 18']}}}}}}
+        result = summarize_archive(self.archive([('failure-manifest.json', json.dumps(value))]))
+        self.assertEqual(result['compilation_records'][0]['terminal_rules'][0],
+                         {'rule': 'PARAGRAPHS_TOO_MANY', 'actual': 19, 'maximum': 18})
+
+    def test_typed_source_failure_and_no_replacement_status_are_recognized(self):
+        result = manifest_details({'failure': {'type': 'SourceEvidenceInsufficient'},
+            'selection': {'selection_audit': {'fallback': {'status': 'no_valid_replacement'}}}})
+        self.assertEqual(result['failure_type'], 'SourceEvidenceInsufficient')
+        self.assertEqual(result['fallback_status'], 'no_valid_replacement')
 
     def test_rejects_unsafe_paths(self):
         with self.assertRaises(ValueError):
