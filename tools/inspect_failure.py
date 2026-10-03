@@ -33,11 +33,24 @@ PATTERNS = {
     'BODY_LENGTH': r'body is too short|too few paragraphs|too many paragraphs',
     'EVIDENCE': r'evidence|source span|unsupported.*number|absent from the source|fact.check',
     'PDF': r'PDF|LibreOffice|soffice|page.count',
+    'PDF_EXCERPT': r'PDF is missing an exact excerpt',
+    'PDF_TEXT_MARKER': r'PDF text layer is missing',
+    'PDF_NO_TEXT': r'PDF page.*no readable text',
+    'PDF_LANGUAGE': r'PDF must contain English text only',
+    'PDF_COUNT': r'PDF page count|page-count quality gate',
+    'PDF_CONVERSION': r'LibreOffice conversion failed',
+    'PDF_BLANK': r'Rendered PDF page.*blank',
+    'PDF_FONT': r'PDF does not embed a recognized',
+    'MODEL_EVIDENCE_INSUFFICIENT': r'Insufficient source evidence',
+    'COMPILATION_EXHAUSTED': r'Deterministic compilation failed|Compilation retry budget exhausted',
+    'PARAGRAPH_NUMBERS': r'numbers absent from.*(?:paragraph|source)',
+    'PARAGRAPH_EVIDENCE': r'paragraph.*(?:evidence|span).*(?:align|match|invalid|insufficient)',
+    'FACTCHECK_FAILED': r'independent fact.check|fact.check.*(?:fail|rejected)',
     'VALIDATION': r'quality gate|validation failed|contract|checksum|digest mismatch',
     'STATE': r'current or next|unpublished|state.*(?:invalid|contract)|already.published|future date',
     'EXECUTION': r'ModuleNotFoundError|ImportError|NameError|AttributeError|TypeError|KeyError',
 }
-PHASES = {'generate', 'validate', 'environment', 'internal', 'issue', 'runtime', 'plan', 'manifest-contract'}
+PHASES = {'generate', 'validate', 'environment', 'internal', 'issue', 'runtime', 'plan', 'manifest-contract', 'generation', 'strict-validation', 'editorial', 'quality', 'render', 'artifact-validation'}
 
 def summarize_text(value: str) -> dict:
     return {code: len(re.findall(pattern, value, re.I)) for code, pattern in PATTERNS.items()
@@ -82,6 +95,15 @@ def summarize_archive(path: Path) -> dict:
                     text = str(data.get('stderr', '')) + '\n' + str(data.get('stdout', ''))
                 else:
                     result['manifest_present'] = True
+                    failure = data.get('failure', {})
+                    if isinstance(failure, dict):
+                        phase = failure.get('phase')
+                        result['phases'].append(phase if phase in PHASES else 'other')
+                    metrics = []
+                    for actual, minimum in re.findall(r'body is too short: ([0-9]{1,6}) chars; minimum is ([0-9]{1,6})', text):
+                        metrics.append({'actual': int(actual), 'minimum': int(minimum)})
+                    if metrics:
+                        result['body_lengths'] = metrics[:10]
                     for section, key in [('collection', 'candidate_count'), ('quality', 'errors')]:
                         section_data = data.get(section, {})
                         if not isinstance(section_data, dict):
