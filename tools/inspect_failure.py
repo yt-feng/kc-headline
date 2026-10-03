@@ -123,12 +123,39 @@ def rule_details(error):
     return {'rule': fixed.get(error, 'UNKNOWN')}
 
 
+
+def terminal_shape(snapshot):
+    """Emit only verified lengths and evidence-partition feasibility, never content."""
+    if not isinstance(snapshot, dict) or snapshot.get('schema_version') != 1 or snapshot.get('terminal') is not True or snapshot.get('draft_complete') is not True:
+        return None
+    draft = snapshot.get('draft')
+    if not isinstance(draft, dict): return None
+    raw = json.dumps(draft, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode()
+    if len(raw) > 256*1024 or hashlib.sha256(raw).hexdigest() != snapshot.get('draft_sha256'): return None
+    paragraphs, rows = draft.get('body_paragraphs'), draft.get('paragraph_evidence_ids')
+    if not isinstance(paragraphs,list) or not isinstance(rows,list) or not 1<=len(rows)<=200 or len(rows)!=len(paragraphs): return None
+    if any(not isinstance(p,str) for p in paragraphs) or any(not isinstance(row,list) or not 1<=len(row)<=3 or any(not isinstance(v,str) or not v for v in row) for row in rows): return None
+    count=len(rows); minimum=[count+1]*(count+1);minimum[count]=0
+    for start in range(count-1,-1,-1):
+        ids=set()
+        for end in range(start+1,count+1):
+            ids.update(rows[end-1])
+            if len(ids)>3:break
+            minimum[start]=min(minimum[start],1+minimum[end])
+    return {'snapshot_verified':True,'paragraph_count':count,'body_characters':sum(map(len,paragraphs)),
+            'minimum_adjacent_groups_with_all_evidence':minimum[0],
+            'paragraph_lengths':[len(p) for p in paragraphs], 'evidence_counts':[len(r) for r in rows]}
+
+
 def revision_details(revision):
     if not isinstance(revision, dict):
         return {}
     row = {}
     if revision.get('gate') in GATES:
         row['gate'] = revision['gate']
+    shape = terminal_shape(revision.get('private_terminal_snapshot'))
+    if shape is not None:
+        row['terminal_shape'] = shape
     errors = revision.get('errors')
     if isinstance(errors, list):
         row['rules'] = [rule_details(error) for error in errors[:20]]
