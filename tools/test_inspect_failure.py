@@ -45,6 +45,16 @@ class InspectionTests(unittest.TestCase):
         self.assertEqual(result['quality_error_count'], 1)
         self.assertEqual(result['codes'], {'BODY_LENGTH': 1})
 
+    def test_specific_codes_and_lengths_never_echo_source_content(self):
+        value = {'failure': {'phase': 'artifact-validation'},
+                 'quality': {'errors': ['Source digest PDF is missing an exact excerpt: private-title',
+                                        'body is too short: 201 chars; minimum is 900']}}
+        result = summarize_archive(self.archive([('failure-manifest.json', json.dumps(value))]))
+        self.assertEqual(result['codes']['PDF_EXCERPT'], 1)
+        self.assertEqual(result['body_lengths'], [{'actual': 201, 'minimum': 900}])
+        self.assertEqual(result['phases'], ['artifact-validation'])
+        self.assertNotIn('private-title', json.dumps(result))
+
     def test_rejects_unsafe_paths(self):
         with self.assertRaises(ValueError):
             summarize_archive(self.archive([('../job.log', 'error')]))
