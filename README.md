@@ -28,3 +28,9 @@ limited to the current or next unpublished Friday in that edition's state and
 cannot target a future date. Complete existing pairs are never overwritten.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the public execution boundary.
+
+For a failed main batch, run **Inspect encrypted failure** with its run ID.
+Actions verifies the original artifact identity, size, digest, and authenticated
+envelope, then reports fixed diagnostic codes and counts. The inspection keeps
+decrypted records inside its temporary runner workspace and performs no generation
+or publication.
