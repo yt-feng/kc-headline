@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 from tools.envelope import encrypt
-from tools.inspect_failure import inspect, summarize_archive
+from tools.inspect_failure import inspect, summarize_archive, manifest_details
 import zipfile
 
 class InspectionTests(unittest.TestCase):
@@ -54,6 +54,15 @@ class InspectionTests(unittest.TestCase):
         self.assertEqual(result['body_lengths'], [{'actual': 201, 'minimum': 900}])
         self.assertEqual(result['phases'], ['artifact-validation'])
         self.assertNotIn('private-title', json.dumps(result))
+
+    def test_manifest_details_keep_text_private(self):
+        result = manifest_details({'failure': {'type': 'ArtifactError', 'message': 'private headline'},
+            'quality': {'errors': ['body is too short: 201 chars; minimum is 900']},
+            'articles': [{'source_title': 'private headline', 'body_paragraphs': ['confi\u00addential']}]})
+        self.assertEqual(result['failed_article_measurements'][0]['excerpt_measurements'][0]['soft_hyphen'], 1)
+        self.assertEqual(result['body_lengths'], [{'actual': 201, 'minimum': 900}])
+        self.assertNotIn('private', json.dumps(result))
+        self.assertNotIn('confi', json.dumps(result))
 
     def test_rejects_unsafe_paths(self):
         with self.assertRaises(ValueError):

@@ -56,6 +56,54 @@ def summarize_text(value: str) -> dict:
     return {code: len(re.findall(pattern, value, re.I)) for code, pattern in PATTERNS.items()
             if re.search(pattern, value, re.I)}
 
+def manifest_details(data: dict) -> dict:
+    """Return schema-bounded measurements, never manifest text or identifiers."""
+    details = {}
+    failure = data.get('failure', {})
+    failure = failure if isinstance(failure, dict) else {}
+    allowed_types = {'ArtifactError', 'LLMError', 'DeterministicCompilationExhausted',
+                     'FactCheckError', 'SourceDigestError', 'PDFExportError', 'ValueError'}
+    if failure.get('type') in allowed_types:
+        details['failure_type'] = failure['type']
+    selection = data.get('selection', {})
+    audit = selection.get('selection_audit', {}) if isinstance(selection, dict) else {}
+    fallback = audit.get('fallback', {}) if isinstance(audit, dict) else {}
+    if isinstance(fallback, dict):
+        status = fallback.get('status')
+        allowed = {'not_triggered', 'applied', 'limit_exhausted', 'replacement_failed',
+                   'no_eligible_candidates', 'failed_candidate_binding_mismatch', 'no_candidates'}
+        details['fallback_status'] = status if status in allowed else 'other'
+        for field in ('attempts', 'limit', 'evaluated_candidates', 'eligible_candidates'):
+            value = fallback.get(field)
+            if type(value) is int and 0 <= value <= 100000:
+                details['fallback_' + field] = value
+    quality = data.get('quality', {})
+    errors = quality.get('errors', []) if isinstance(quality, dict) else []
+    # Decode strings before matching lengths; JSON escaping can hide punctuation.
+    text = '\n'.join(str(v) for v in errors) if isinstance(errors, list) else ''
+    metrics = re.findall(r'body is too short: ([0-9]{1,6}) chars; minimum is ([0-9]{1,6})', text)
+    if metrics:
+        details['body_lengths'] = [{'actual': int(a), 'minimum': int(m)} for a,m in metrics[:10]]
+    rows = data.get('articles', [])
+    if isinstance(rows, list) and len(rows) <= 5:
+        failures = []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict) or not row.get('source_title'):
+                continue
+            if str(row['source_title']) not in str(failure.get('message', '')):
+                continue
+            excerpts = row.get('body_paragraphs', [])
+            if isinstance(excerpts, list):
+                failures.append({'slot': index + 1, 'excerpt_measurements': [
+                    {'length': len(t), 'soft_hyphen': t.count('\u00ad'),
+                     'zero_width_space': t.count('\u200b'), 'line_breaks': t.count('\n'),
+                     'nonbreaking_hyphen': t.count('\u2011')}
+                    for t in excerpts[:20] if isinstance(t, str)]})
+        if failures:
+            details['failed_article_measurements'] = failures
+    return details
+
+
 def summarize_archive(path: Path) -> dict:
     result = {'schema_version': 1, 'files_inspected': 0, 'codes': {}, 'phases': [],
               'diagnostic_present': False, 'manifest_present': False}
@@ -95,6 +143,7 @@ def summarize_archive(path: Path) -> dict:
                     text = str(data.get('stderr', '')) + '\n' + str(data.get('stdout', ''))
                 else:
                     result['manifest_present'] = True
+                    result.update(manifest_details(data))
                     failure = data.get('failure', {})
                     if isinstance(failure, dict):
                         phase = failure.get('phase')
